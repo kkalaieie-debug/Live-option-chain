@@ -1,0 +1,38 @@
+{
+  "indices": {
+    "NIFTY": {
+      "exchange": "NSE",
+      "exchangeType": 1,
+      "spot": {
+        "token": "",
+        "symbol": "NIFTY 50",
+        "exchangeType": 1
+      },
+      "options": [],
+      "futures": []
+    },
+    "BANKNIFTY": {
+      "exchange": "NSE",
+      "exchangeType": 2,
+      "spot": {
+        "token": "",
+        "symbol": "NIFTY BANK",
+        "exchangeType": 1
+      },
+      "options": [],
+      "futures": []
+    },
+    "SENSEX": {
+      "exchange": "BSE",
+      "exchangeType": 4,
+      "spot": {
+        "token": "",
+        "symbol": "SENSEX",
+        "exchangeType": 3
+      },
+      "options": [],
+      "futures": []
+    }
+  },
+  "_instructions": "Populate token, expiry (YYYY-MM-DD), strike, optionType (CE/PE), tradingSymbol and lotSize from the current Angel One instrument master. Set each derivative contract exchangeType explicitly: NSE_FO=2, BSE_FO=4. Spot tokens use NSE_CM=1 or BSE_CM=3. Verify current exchange codes in SmartAPI docs."
+}

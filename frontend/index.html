@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TradePulse Live Option Chain</title><link rel="stylesheet" href="styles.css">
+</head><body>
+<header><div class="brand"><span class="logo">TP</span><div><b>TRADEPULSE</b><small>LIVE OPTION CHAIN & MARKET INTELLIGENCE</small></div></div><div class="right"><span id="feed" class="pill offline">CONNECTING</span><span id="updated">—</span></div></header>
+<main>
+<nav id="tabs"><button class="active" data-index="NIFTY">NIFTY</button><button data-index="BANKNIFTY">BANKNIFTY</button><button data-index="SENSEX">SENSEX</button></nav>
+<section class="metrics">
+<div class="metric"><label>TOTAL CE OI</label><strong id="ceoi">—</strong></div><div class="metric"><label>TOTAL PE OI</label><strong id="peoi">—</strong></div><div class="metric"><label>PCR</label><strong id="pcr">—</strong></div><div class="metric"><label>MAX PAIN</label><strong id="maxpain">—</strong></div><div class="metric"><label>SPOT LTP</label><strong id="spot">—</strong></div><div class="metric"><label>MARKET SENTIMENT</label><strong id="sentiment">—</strong></div>
+</section>
+<section class="panel"><div class="panelhead"><h2>OI BUILDUP SUMMARY</h2><span>Contract counts • CE / PE / Futures</span></div><div class="buildgrid" id="buildgrid"></div></section>
+<section class="panel"><div class="panelhead"><h2>LIVE OPTION CHAIN</h2><span>Updates as Angel One ticks arrive</span></div>
+<div class="tablewrap"><table><thead><tr><th colspan="9">CALL OPTIONS (CE)</th><th rowspan="2">STRIKE</th><th colspan="5">PUT OPTIONS (PE)</th></tr>
+<tr><th>OI</th><th>Δ OI</th><th>LTP</th><th>IV</th><th>BUILDUP</th><th>BUILDUP</th><th>TIME VALUE</th><th>INTRINSIC</th><th>GAMMA</th><th>DELTA</th><th>IV</th><th>LTP</th><th>Δ OI</th><th>OI</th></tr></thead><tbody id="chain"><tr><td colspan="11" class="empty">Waiting for live market feed and configured contracts…</td></tr></tbody></table></div></section>
+<section class="panel"><div class="panelhead"><h2>INDEX FUTURES</h2><span>Price + OI classification</span></div><div class="tablewrap"><table><thead><tr><th>SYMBOL</th><th>LTP</th><th>OI</th><th>Δ OI</th><th>PRICE Δ</th><th>CLASSIFICATION</th></tr></thead><tbody id="futures"><tr><td colspan="6" class="empty">No futures ticks yet</td></tr></tbody></table></div></section>
+<section class="footnote">Analytics are inferred from price and OI changes. Greeks require a valid spot tick and expiry. No live values are displayed until received from Angel One.</section>
+</main><script src="config.js"></script><script src="app.js"></script></body></html>

@@ -1,148 +1,90 @@
 
-import pg from 'pg';
+import { Pool } from 'pg';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { config } from './config.js';
 
-const { Pool } = pg;
-
-// -----------------------------------------------------
-// DATABASE CONNECTION
-// -----------------------------------------------------
+// --------------------------------------------------
+// PostgreSQL connection
+// --------------------------------------------------
 
 export const pool = config.databaseUrl
   ? new Pool({
       connectionString: config.databaseUrl,
-      ssl:
-        process.env.NODE_ENV === 'production'
-          ? { rejectUnauthorized: false }
-          : false,
-
-      // Keep the connection count low on Render.
+      ssl: process.env.NODE_ENV === 'production'
+        ? { rejectUnauthorized: false }
+        : false,
       max: 2,
-      min: 0,
-
-      connectionTimeoutMillis: 5000,
       idleTimeoutMillis: 10000,
-      query_timeout: 10000,
-      statement_timeout: 10000,
-
-      keepAlive: true,
-      keepAliveInitialDelayMillis: 10000
+      connectionTimeoutMillis: 10000,
+      query_timeout: 15000,
+      statement_timeout: 15000,
+      keepAlive: true
     })
   : null;
 
-if (pool) {
-  pool.on('error', error => {
-    console.error('[Database] Pool error:', error.message);
-  });
-}
+pool?.on('error', error => {
+  console.error('[Database] Pool error:', error.message);
+});
 
-// -----------------------------------------------------
-// WRITE QUEUES
-// -----------------------------------------------------
+// --------------------------------------------------
+// Queues: keep the latest value per instrument
+// --------------------------------------------------
 
 const tickQueue = new Map();
 const oiQueue = new Map();
 
-const MAX_QUEUE_SIZE = 4000;
-const BATCH_SIZE = 100;
-const FLUSH_INTERVAL_MS = 2500;
+const MAX_QUEUE = 3000;
+const BATCH_SIZE = 50;
+const FLUSH_MS = 3000;
 
-let flushing = false;
-let lastDatabaseWarning = 0;
+let isFlushing = false;
+let lastWarning = 0;
 
-function databaseWarning(message) {
-  const now = Date.now();
-
-  // Avoid printing hundreds of identical errors.
-  if (now - lastDatabaseWarning >= 30000) {
-    lastDatabaseWarning = now;
+function warn(message) {
+  if (Date.now() - lastWarning > 30000) {
+    lastWarning = Date.now();
     console.error('[Database]', message);
   }
 }
 
-function queueLatest(queue, item) {
-  const key = String(item.key || '');
+function put(queue, item) {
+  if (!item?.key) return;
 
-  if (!key) return;
+  queue.delete(String(item.key));
+  queue.set(String(item.key), item);
 
-  // Keep only the newest pending value for each instrument.
-  queue.set(key, item);
-
-  // Prevent unlimited memory growth if PostgreSQL is unavailable.
-  while (queue.size > MAX_QUEUE_SIZE) {
-    const oldestKey = queue.keys().next().value;
-    queue.delete(oldestKey);
+  while (queue.size > MAX_QUEUE) {
+    queue.delete(queue.keys().next().value);
   }
 }
 
-function toTimestamp(value) {
+function n(value) {
   if (value === undefined || value === null || value === '') {
     return null;
   }
 
-  if (typeof value === 'number' || /^\d+$/.test(String(value))) {
-    const number = Number(value);
+  const result = Number(value);
+  return Number.isFinite(result) ? result : null;
+}
 
-    if (!Number.isFinite(number)) return null;
-
-    const milliseconds =
-      number < 100000000000 ? number * 1000 : number;
-
-    const date = new Date(milliseconds);
-
-    return Number.isNaN(date.getTime()) ? null : date;
+function dateValue(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
   }
 
-  const date = new Date(value);
+  const numeric = Number(value);
+
+  const date = Number.isFinite(numeric) && numeric > 0
+    ? new Date(numeric < 1e12 ? numeric * 1000 : numeric)
+    : new Date(value);
 
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function numberOrNull(value) {
-  if (value === undefined || value === null || value === '') {
-    return null;
-  }
-
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-// -----------------------------------------------------
-// BATCH INSERT HELPER
-// -----------------------------------------------------
-
-async function insertBatch(table, columns, rows) {
-  if (!pool || !rows.length) return;
-
-  const values = [];
-  const placeholders = [];
-
-  rows.forEach((row, rowIndex) => {
-    const rowPlaceholders = [];
-
-    row.forEach((value, columnIndex) => {
-      values.push(value);
-
-      const position = rowIndex * columns.length + columnIndex + 1;
-      rowPlaceholders.push(`$${position}`);
-    });
-
-    placeholders.push(`(${rowPlaceholders.join(',')})`);
-  });
-
-  const sql = `
-    INSERT INTO ${table} (${columns.join(',')})
-    VALUES ${placeholders.join(',')}
-  `;
-
-  await pool.query(sql, values);
-}
-
-// -----------------------------------------------------
-// DATABASE INITIALIZATION
-// -----------------------------------------------------
+// --------------------------------------------------
+// Initialize database
+// --------------------------------------------------
 
 export async function initDb() {
   if (!pool) {
@@ -150,72 +92,103 @@ export async function initDb() {
     return;
   }
 
+  const connection = await pool.connect();
+
   try {
-    await pool.query('SELECT 1');
+    await connection.query('SELECT 1');
 
-    const schemaPath = path.resolve('db/schema.sql');
-    const schema = await fs.readFile(schemaPath, 'utf8');
+    const schema = await fs.readFile(
+      path.resolve('db/schema.sql'),
+      'utf8'
+    );
 
-    await pool.query(schema);
+    await connection.query(schema);
 
-    console.log('[Database] PostgreSQL connected successfully.');
-    console.log('[Database] Database schema initialized.');
-  } catch (error) {
-    console.error('[Database] Initialization failed:', error.message);
-    throw error;
+    console.log('[Database] PostgreSQL connected.');
+    console.log('[Database] Schema initialization completed.');
+  } finally {
+    connection.release();
   }
 }
 
-// -----------------------------------------------------
-// QUEUE TICK
-// Called by engine.js for each eligible tick.
-// -----------------------------------------------------
+// --------------------------------------------------
+// Queue tick
+// --------------------------------------------------
 
-export async function saveTick(tick) {
-  if (!pool || !tick) return;
+export async function saveTick(t) {
+  if (!pool || !t) return;
 
-  queueLatest(tickQueue, {
-    key: tick.key,
-    indexName: tick.indexName,
-    segment: tick.segment,
-    optionType: tick.optionType || null,
-    strike: numberOrNull(tick.strike),
-    expiry: tick.expiry || null,
-    ltp: numberOrNull(tick.ltp),
-    oi: numberOrNull(tick.oi),
-    volume: numberOrNull(tick.volume),
-    exchangeTime: toTimestamp(tick.exchangeTime)
+  put(tickQueue, {
+    key: String(t.key || ''),
+    indexName: t.indexName ?? null,
+    segment: t.segment ?? null,
+    optionType: t.optionType ?? null,
+    strike: n(t.strike),
+    expiry: t.expiry ?? null,
+    ltp: n(t.ltp),
+    oi: n(t.oi),
+    volume: n(t.volume),
+    exchangeTime: dateValue(t.exchangeTime)
   });
 }
 
-// -----------------------------------------------------
-// QUEUE OI SNAPSHOT
-// -----------------------------------------------------
+// --------------------------------------------------
+// Queue OI snapshot
+// --------------------------------------------------
 
-export async function saveOiSnapshot(snapshot) {
-  if (!pool || !snapshot) return;
+export async function saveOiSnapshot(s) {
+  if (!pool || !s) return;
 
-  queueLatest(oiQueue, {
-    key: snapshot.key,
-    indexName: snapshot.indexName,
-    segment: snapshot.segment,
-    optionType: snapshot.optionType || null,
-    strike: numberOrNull(snapshot.strike),
-    expiry: snapshot.expiry || null,
-    ltp: numberOrNull(snapshot.ltp),
-    oi: numberOrNull(snapshot.oi),
-    oiChange: numberOrNull(snapshot.oiChange),
-    priceChange: numberOrNull(snapshot.priceChange),
-    classification: snapshot.classification || 'Unknown'
+  put(oiQueue, {
+    key: String(s.key || ''),
+    indexName: s.indexName ?? null,
+    segment: s.segment ?? null,
+    optionType: s.optionType ?? null,
+    strike: n(s.strike),
+    expiry: s.expiry ?? null,
+    ltp: n(s.ltp),
+    oi: n(s.oi),
+    oiChange: n(s.oiChange),
+    priceChange: n(s.priceChange),
+    classification: s.classification ?? 'Unknown'
   });
 }
 
-// -----------------------------------------------------
-// FLUSH ONE QUEUE IN BATCHES
-// -----------------------------------------------------
+// --------------------------------------------------
+// Batch SQL helper
+// --------------------------------------------------
 
-async function flushQueue(queue, table, columns, mapper) {
-  if (!pool || queue.size === 0) return;
+async function insertRows(table, columns, rows) {
+  if (!pool || rows.length === 0) return;
+
+  const values = [];
+  const groups = [];
+
+  for (const row of rows) {
+    const placeholders = [];
+
+    for (const value of row) {
+      values.push(value);
+      placeholders.push(`$${values.length}`);
+    }
+
+    groups.push(`(${placeholders.join(',')})`);
+  }
+
+  const sql = `
+    INSERT INTO ${table} (${columns.join(',')})
+    VALUES ${groups.join(',')}
+  `;
+
+  await pool.query(sql, values);
+}
+
+// --------------------------------------------------
+// Flush a queue
+// --------------------------------------------------
+
+async function flushOne(queue, table, columns, mapper) {
+  if (queue.size === 0) return;
 
   const entries = [...queue.entries()].slice(0, BATCH_SIZE);
 
@@ -226,30 +199,28 @@ async function flushQueue(queue, table, columns, mapper) {
   const rows = entries.map(([, item]) => mapper(item));
 
   try {
-    await insertBatch(table, columns, rows);
+    await insertRows(table, columns, rows);
   } catch (error) {
-    // Restore failed rows unless a newer value is already queued.
+    // Restore failed items without overwriting newer ticks.
     for (const [key, item] of entries) {
-      if (!queue.has(key)) {
-        queue.set(key, item);
-      }
+      if (!queue.has(key)) queue.set(key, item);
     }
 
-    databaseWarning(`${table} batch write failed: ${error.message}`);
+    warn(`${table} write failed: ${error.message}`);
   }
 }
 
-// -----------------------------------------------------
-// FLUSH BOTH QUEUES
-// -----------------------------------------------------
+// --------------------------------------------------
+// Periodic database writer
+// --------------------------------------------------
 
-async function flushDatabaseQueues() {
-  if (!pool || flushing) return;
+async function flushQueues() {
+  if (!pool || isFlushing) return;
 
-  flushing = true;
+  isFlushing = true;
 
   try {
-    await flushQueue(
+    await flushOne(
       tickQueue,
       'ticks',
       [
@@ -264,21 +235,21 @@ async function flushDatabaseQueues() {
         'volume',
         'exchange_time'
       ],
-      item => [
-        item.key,
-        item.indexName,
-        item.segment,
-        item.optionType,
-        item.strike,
-        item.expiry,
-        item.ltp,
-        item.oi,
-        item.volume,
-        item.exchangeTime
+      t => [
+        t.key,
+        t.indexName,
+        t.segment,
+        t.optionType,
+        t.strike,
+        t.expiry,
+        t.ltp,
+        t.oi,
+        t.volume,
+        t.exchangeTime
       ]
     );
 
-    await flushQueue(
+    await flushOne(
       oiQueue,
       'oi_snapshots',
       [
@@ -294,62 +265,60 @@ async function flushDatabaseQueues() {
         'price_change',
         'classification'
       ],
-      item => [
-        item.key,
-        item.indexName,
-        item.segment,
-        item.optionType,
-        item.strike,
-        item.expiry,
-        item.ltp,
-        item.oi,
-        item.oiChange,
-        item.priceChange,
-        item.classification
+      s => [
+        s.key,
+        s.indexName,
+        s.segment,
+        s.optionType,
+        s.strike,
+        s.expiry,
+        s.ltp,
+        s.oi,
+        s.oiChange,
+        s.priceChange,
+        s.classification
       ]
     );
   } finally {
-    flushing = false;
+    isFlushing = false;
   }
 }
 
-// Run the batch writer continuously without blocking server startup.
-const flushTimer = setInterval(() => {
-  flushDatabaseQueues().catch(error => {
-    databaseWarning(`Queue flush error: ${error.message}`);
+const timer = setInterval(() => {
+  flushQueues().catch(error => {
+    warn(`Flush failed: ${error.message}`);
   });
-}, FLUSH_INTERVAL_MS);
+}, FLUSH_MS);
 
-flushTimer.unref();
+timer.unref();
 
-// -----------------------------------------------------
-// LATEST TICK HISTORY
-// -----------------------------------------------------
+// --------------------------------------------------
+// History API
+// --------------------------------------------------
 
 export async function latestSnapshots(indexName) {
   if (!pool) return [];
 
-  const query = `
-    SELECT DISTINCT ON (instrument_key) *
-    FROM ticks
-    WHERE index_name = $1
-    ORDER BY instrument_key, received_at DESC
-  `;
-
-  const result = await pool.query(query, [indexName]);
+  const result = await pool.query(
+    `SELECT DISTINCT ON (instrument_key) *
+     FROM ticks
+     WHERE index_name = $1
+     ORDER BY instrument_key, received_at DESC`,
+    [indexName]
+  );
 
   return result.rows;
 }
 
-// -----------------------------------------------------
-// DATABASE STATUS
-// -----------------------------------------------------
+// --------------------------------------------------
+// Queue diagnostics
+// --------------------------------------------------
 
 export function getDatabaseQueueStatus() {
   return {
     configured: Boolean(pool),
-    tickQueue: tickQueue.size,
-    oiQueue: oiQueue.size,
-    flushing
+    pendingTicks: tickQueue.size,
+    pendingOi: oiQueue.size,
+    flushing: isFlushing
   };
 }

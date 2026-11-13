@@ -43,7 +43,22 @@ export async function buildContracts({ getLtp, forceMaster = false } = {}) {
   const out = { indices: {}, generatedAt: new Date().toISOString(), source: 'Angel One OpenAPIScripMaster' };
   for (const name of Object.keys(META)) {
     const m = META[name];
-    const spotRow = master.find(x => up(x.exch_seg) === m.cash && up(x.instrumenttype) === 'AMXIDX' && (up(x.name) === name || up(x.symbol).includes(name)));
+    const spotAliases = {
+  NIFTY: ['NIFTY 50', 'NIFTY50'],
+  BANKNIFTY: ['NIFTY BANK', 'BANKNIFTY'],
+  SENSEX: ['SENSEX']
+};
+
+const aliases = spotAliases[name];
+
+const spotRow = master.find(x =>
+  up(x.exch_seg) === m.cash &&
+  up(x.instrumenttype) === 'AMXIDX' &&
+  (
+    aliases.includes(up(x.symbol)) ||
+    aliases.includes(up(x.name))
+  )
+);
     if (!spotRow) throw new Error(`Spot token not found for ${name} in Angel One master`);
     const spot = { token: String(spotRow.token), symbol: String(spotRow.symbol), exchange: m.cash, exchangeType: m.cashType };
     const ltp = await spotLtp(getLtp, m, spot);

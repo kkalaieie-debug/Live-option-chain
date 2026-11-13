@@ -7,15 +7,13 @@ let smartApi = null;
 let ws = null;
 let session = null;
 
-// ==========================================
-// LOGIN
-// ==========================================
-
 export async function loginAngel() {
   const { apiKey, clientCode, pin, totpSecret } = config.angel;
 
   if (!apiKey || !clientCode || !pin || !totpSecret) {
-    throw new Error('Missing Angel One credentials. Check Render environment variables.');
+    throw new Error(
+      'Missing Angel One credentials. Check Render environment variables.'
+    );
   }
 
   console.log('[Angel One] Starting login');
@@ -27,18 +25,27 @@ export async function loginAngel() {
     encoding: 'base32'
   });
 
-  const result = await smartApi.generateSession(clientCode, pin, totp);
+  const result = await smartApi.generateSession(
+    clientCode,
+    pin,
+    totp
+  );
 
   if (!result?.status || !result?.data?.jwtToken) {
     throw new Error(
-      `Angel One login failed: ${result?.message || 'Invalid login response'}`
+      `Angel One login failed: ${result?.message || 'No JWT token received'}`
     );
   }
 
-  const feedToken = result.data.feedToken;
+  const feedResponse = await smartApi.getfeedToken();
 
-  if (!feedToken) {
-    throw new Error('Angel One feed token missing from login response.');
+  const feedToken =
+    feedResponse?.data?.feedToken ||
+    feedResponse?.feedToken ||
+    feedResponse;
+
+  if (!feedToken || typeof feedToken !== 'string') {
+    throw new Error('Angel One feed token was not received');
   }
 
   session = {
@@ -55,66 +62,39 @@ export async function loginAngel() {
   };
 }
 
-// ==========================================
-// LIVE LTP USING ANGEL ONE MARKET DATA API
-// ==========================================
-
-export async function getAngelLtp(exchange, tradingsymbol, symboltoken) {
+export async function getAngelLtp(
+  exchange,
+  tradingsymbol,
+  symboltoken
+) {
   if (!smartApi) {
-    throw new Error('Angel One is not logged in.');
+    throw new Error('Angel One session is not initialized');
   }
 
-  try {
-    const result = await smartApi.marketData({
-      mode: 'LTP',
-      exchangeTokens: {
-        [exchange]: [String(symboltoken)]
-      }
-    });
+  const result = await smartApi.ltpData({
+    exchange,
+    tradingsymbol,
+    symboltoken: String(symboltoken)
+  });
 
-    if (!result?.status) {
-      throw new Error(
-        result?.message || `Market data request failed for ${tradingsymbol}`
-      );
-    }
-
-    const fetched = result?.data?.fetched || [];
-
-    const quote = fetched.find(
-      item => String(item.symbolToken) === String(symboltoken)
-    ) || fetched[0];
-
-    if (!quote || quote.ltp === undefined || quote.ltp === null) {
-      const reason = result?.data?.unfetched?.[0]?.message;
-      throw new Error(
-        reason || `No LTP returned for ${tradingsymbol}`
-      );
-    }
-
-    console.log(
-      `[Angel One] LTP received: ${tradingsymbol} = ${quote.ltp}`
+  if (!result?.status || !result?.data) {
+    throw new Error(
+      `LTP request failed for ${tradingsymbol}: ${result?.message || 'No data'}`
     );
-
-    // Keep the response format expected by instruments.js
-    return {
-      status: true,
-      message: result.message || 'SUCCESS',
-      data: quote
-    };
-
-  } catch (error) {
-    console.error(
-      `[Angel One] LTP error for ${tradingsymbol}:`,
-      error.message
-    );
-
-    throw error;
   }
+
+  const ltp = Number(result.data.ltp);
+
+  if (!Number.isFinite(ltp) || ltp <= 0) {
+    throw new Error(`Invalid LTP received for ${tradingsymbol}`);
+  }
+
+  console.log(
+    `[Angel One] LTP received: ${tradingsymbol} = ${ltp}`
+  );
+
+  return result;
 }
-
-// ==========================================
-// WEBSOCKET V2 CONNECTION
-// ==========================================
 
 export async function connectAngel(onTick, onStatus) {
   if (!session) {
@@ -124,15 +104,17 @@ export async function connectAngel(onTick, onStatus) {
   if (ws) {
     try {
       ws.close();
-    } catch (error) {
-      console.warn('[Angel One] Previous socket close warning:', error.message);
+    } catch {
+      // Ignore errors while closing an old connection.
     }
-
     ws = null;
   }
 
   console.log('[Angel One] Creating WebSocket V2 connection');
 
+  // IMPORTANT:
+  // The SmartAPI JavaScript SDK expects the feed token
+  // in the "feedtype" property, not "feedToken".
   ws = new WebSocketV2({
     jwttoken: session.jwt,
     apikey: config.angel.apiKey,
@@ -140,24 +122,26 @@ export async function connectAngel(onTick, onStatus) {
     feedtype: session.feedToken
   });
 
-  ws.on('tick', data => {
-    onTick(data);
+  ws.on('tick', (data) => {
+    try {
+      onTick(data);
+    } catch (error) {
+      console.error('[Angel One] Tick handler error:', error);
+    }
   });
 
-  ws.on('error', error => {
-    console.error('[Angel One] WebSocket error:', error);
-
-    onStatus({
+  ws.on('error', (error) => {
+    console.error('[Angel One] WebSocket error:', error?.message || error);
+    onStatus?.({
       connected: false,
       error: error?.message || String(error),
-      phase: 'websocket_error'
+      phase: 'websocket-error'
     });
   });
 
   ws.on('close', () => {
-    console.warn('[Angel One] WebSocket disconnected');
-
-    onStatus({
+    console.warn('[Angel One] WebSocket closed');
+    onStatus?.({
       connected: false,
       phase: 'disconnected'
     });
@@ -168,78 +152,57 @@ export async function connectAngel(onTick, onStatus) {
 
     console.log('[Angel One] WebSocket connected');
 
-    onStatus({
+    onStatus?.({
       connected: true,
+      error: null,
       phase: 'connected'
     });
 
     return ws;
-
   } catch (error) {
-    console.error('[Angel One] WebSocket connection failed:', error);
+    console.error(
+      '[Angel One] WebSocket connection failed:',
+      error?.message || error
+    );
 
-    onStatus({
+    onStatus?.({
       connected: false,
       error: error?.message || String(error),
-      phase: 'connection_failed'
+      phase: 'connection-error'
     });
 
     throw error;
   }
 }
 
-// ==========================================
-// SUBSCRIBE INSTRUMENTS
-// Supports grouped and flat instrument formats
-// ==========================================
-
-export function subscribeAngel(list) {
+export function subscribeAngel(subscriptionGroups) {
   if (!ws) {
-    throw new Error('Angel One WebSocket is not connected.');
+    throw new Error('WebSocket is not connected');
   }
 
-  if (!Array.isArray(list) || list.length === 0) {
-    throw new Error('No instruments supplied for subscription.');
-  }
+  let requestCount = 0;
 
-  const groups = new Map();
+  for (const group of subscriptionGroups) {
+    const exchangeType = Number(group.exchangeType);
+    const tokens = [...new Set(
+      (group.tokens || []).map(String).filter(Boolean)
+    )];
 
-  function addToken(exchangeType, token) {
-    const type = Number(exchangeType);
-    const value = String(token ?? '').trim();
-
-    if (!Number.isInteger(type) || !value || value === 'undefined') {
-      return;
+    if (
+      !Number.isInteger(exchangeType) ||
+      exchangeType < 1 ||
+      exchangeType > 5 ||
+      tokens.length === 0
+    ) {
+      console.warn(
+        '[Angel One] Skipping invalid subscription:',
+        group
+      );
+      continue;
     }
-
-    if (!groups.has(type)) {
-      groups.set(type, new Set());
-    }
-
-    groups.get(type).add(value);
-  }
-
-  for (const item of list) {
-    if (!item) continue;
-
-    if (Array.isArray(item.tokens)) {
-      for (const token of item.tokens) {
-        addToken(item.exchangeType, token);
-      }
-    } else if (item.token !== undefined) {
-      addToken(item.exchangeType, item.token);
-    }
-  }
-
-  let totalSubscribed = 0;
-
-  for (const [exchangeType, tokenSet] of groups.entries()) {
-    const tokens = [...tokenSet];
-
-    if (!tokens.length) continue;
 
     const request = {
-      correlationID: `tradepulse-${exchangeType}`,
+      correlationID: `tp${Date.now()}${requestCount}`.slice(0, 20),
       action: 1,
       mode: 3,
       exchangeType,
@@ -251,40 +214,26 @@ export function subscribeAngel(list) {
     );
 
     ws.fetchData(request);
-
-    totalSubscribed += tokens.length;
+    requestCount++;
   }
 
   console.log(
-    `[Angel One] Total subscription requests sent: ${totalSubscribed}`
+    `[Angel One] Total subscription requests sent: ${requestCount}`
   );
 
-  if (totalSubscribed === 0) {
-    throw new Error('No valid tokens found in subscription data.');
-  }
-
-  return {
-    subscribed: totalSubscribed,
-    groups: groups.size
-  };
+  return requestCount;
 }
 
-// ==========================================
-// DISCONNECT
-// ==========================================
-
-export function disconnectAngel() {
+export function closeAngel() {
   if (ws) {
     try {
       ws.close();
     } catch (error) {
-      console.warn('[Angel One] Socket close warning:', error.message);
+      console.error('[Angel One] Error closing WebSocket:', error);
     }
   }
 
   ws = null;
   session = null;
   smartApi = null;
-
-  console.log('[Angel One] Disconnected');
 }

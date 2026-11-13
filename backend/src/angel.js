@@ -11,9 +11,7 @@ export async function loginAngel() {
   const { apiKey, clientCode, pin, totpSecret } = config.angel;
 
   if (!apiKey || !clientCode || !pin || !totpSecret) {
-    throw new Error(
-      'Missing Angel One credentials. Check Render environment variables.'
-    );
+    throw new Error('Missing Angel One credentials in Render environment');
   }
 
   console.log('[Angel One] Starting login');
@@ -33,19 +31,17 @@ export async function loginAngel() {
 
   if (!result?.status || !result?.data?.jwtToken) {
     throw new Error(
-      `Angel One login failed: ${result?.message || 'No JWT token received'}`
+      `Angel One login failed: ${result?.message || 'JWT token missing'}`
     );
   }
 
-  const feedResponse = await smartApi.getfeedToken();
+  // Feed token is returned directly by generateSession().
+  const feedToken = result.data.feedToken;
 
-  const feedToken =
-    feedResponse?.data?.feedToken ||
-    feedResponse?.feedToken ||
-    feedResponse;
-
-  if (!feedToken || typeof feedToken !== 'string') {
-    throw new Error('Angel One feed token was not received');
+  if (!feedToken) {
+    throw new Error(
+      'Feed token missing from Angel One generateSession response'
+    );
   }
 
   session = {
@@ -54,7 +50,7 @@ export async function loginAngel() {
   };
 
   console.log('[Angel One] Login successful');
-  console.log('[Angel One] Feed token received');
+  console.log('[Angel One] Feed token received from login response');
 
   return {
     loggedIn: true,
@@ -79,14 +75,14 @@ export async function getAngelLtp(
 
   if (!result?.status || !result?.data) {
     throw new Error(
-      `LTP request failed for ${tradingsymbol}: ${result?.message || 'No data'}`
+      `LTP failed for ${tradingsymbol}: ${result?.message || 'No data'}`
     );
   }
 
   const ltp = Number(result.data.ltp);
 
   if (!Number.isFinite(ltp) || ltp <= 0) {
-    throw new Error(`Invalid LTP received for ${tradingsymbol}`);
+    throw new Error(`Invalid LTP for ${tradingsymbol}`);
   }
 
   console.log(
@@ -105,16 +101,13 @@ export async function connectAngel(onTick, onStatus) {
     try {
       ws.close();
     } catch {
-      // Ignore errors while closing an old connection.
+      // Ignore old socket close errors.
     }
     ws = null;
   }
 
   console.log('[Angel One] Creating WebSocket V2 connection');
 
-  // IMPORTANT:
-  // The SmartAPI JavaScript SDK expects the feed token
-  // in the "feedtype" property, not "feedToken".
   ws = new WebSocketV2({
     jwttoken: session.jwt,
     apikey: config.angel.apiKey,
@@ -131,16 +124,19 @@ export async function connectAngel(onTick, onStatus) {
   });
 
   ws.on('error', (error) => {
-    console.error('[Angel One] WebSocket error:', error?.message || error);
+    const message = error?.message || String(error);
+    console.error('[Angel One] WebSocket error:', message);
+
     onStatus?.({
       connected: false,
-      error: error?.message || String(error),
+      error: message,
       phase: 'websocket-error'
     });
   });
 
   ws.on('close', () => {
     console.warn('[Angel One] WebSocket closed');
+
     onStatus?.({
       connected: false,
       phase: 'disconnected'
@@ -160,14 +156,16 @@ export async function connectAngel(onTick, onStatus) {
 
     return ws;
   } catch (error) {
+    const message = error?.message || String(error);
+
     console.error(
       '[Angel One] WebSocket connection failed:',
-      error?.message || error
+      message
     );
 
     onStatus?.({
       connected: false,
-      error: error?.message || String(error),
+      error: message,
       phase: 'connection-error'
     });
 
@@ -184,9 +182,14 @@ export function subscribeAngel(subscriptionGroups) {
 
   for (const group of subscriptionGroups) {
     const exchangeType = Number(group.exchangeType);
-    const tokens = [...new Set(
-      (group.tokens || []).map(String).filter(Boolean)
-    )];
+
+    const tokens = [
+      ...new Set(
+        (group.tokens || [])
+          .map(String)
+          .filter(Boolean)
+      )
+    ];
 
     if (
       !Number.isInteger(exchangeType) ||
@@ -229,7 +232,7 @@ export function closeAngel() {
     try {
       ws.close();
     } catch (error) {
-      console.error('[Angel One] Error closing WebSocket:', error);
+      console.error('[Angel One] Socket close error:', error);
     }
   }
 

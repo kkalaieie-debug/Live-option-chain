@@ -7,18 +7,29 @@ let smartApi = null;
 let ws = null;
 let session = null;
 
+// ==========================================
+// ANGEL ONE LOGIN
+// ==========================================
+
 export async function loginAngel() {
-  const { apiKey, clientCode, pin, totpSecret } = config.angel;
+  const {
+    apiKey,
+    clientCode,
+    pin,
+    totpSecret
+  } = config.angel;
 
   if (!apiKey || !clientCode || !pin || !totpSecret) {
     throw new Error(
-      'Missing Angel One credentials. Check ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_PIN and ANGEL_TOTP_SECRET.'
+      'Missing Angel One credentials. Check Render environment variables.'
     );
   }
 
   console.log('[Angel One] Starting login');
 
-  smartApi = new SmartAPI({ api_key: apiKey });
+  smartApi = new SmartAPI({
+    api_key: apiKey
+  });
 
   const totp = speakeasy.totp({
     secret: totpSecret,
@@ -42,16 +53,17 @@ export async function loginAngel() {
 
   if (!feedToken) {
     throw new Error(
-      'Angel One login succeeded but feedToken was missing from the login response.'
+      'Login succeeded, but feed token was missing.'
     );
   }
 
   session = {
     jwt: jwtToken,
-    feedToken
+    feedToken: feedToken
   };
 
-  console.log('[Angel One] Login successful; feed token received');
+  console.log('[Angel One] Login successful');
+  console.log('[Angel One] Feed token received');
 
   return {
     loggedIn: true,
@@ -59,25 +71,47 @@ export async function loginAngel() {
   };
 }
 
-export async function getAngelLtp(exchange, tradingsymbol, symboltoken) {
+// ==========================================
+// GET LIVE SPOT / OPTION LTP
+// ==========================================
+
+export async function getAngelLtp(
+  exchange,
+  tradingsymbol,
+  symboltoken
+) {
   if (!smartApi) {
     throw new Error('Angel One is not logged in.');
   }
 
-  const result = await smartApi.getLtpData({
-    exchange,
-    tradingsymbol,
-    symboltoken: String(symboltoken)
-  });
-
-  if (!result?.status) {
-    throw new Error(
-      result?.message || `LTP request failed for ${tradingsymbol}`
+  try {
+    const result = await smartApi.ltpData(
+      exchange,
+      tradingsymbol,
+      String(symboltoken)
     );
-  }
 
-  return result;
+    if (!result?.status) {
+      throw new Error(
+        result?.message || 'Angel One LTP request failed.'
+      );
+    }
+
+    return result;
+
+  } catch (error) {
+    console.error(
+      `[Angel One] LTP error for ${tradingsymbol}:`,
+      error.message
+    );
+
+    throw error;
+  }
 }
+
+// ==========================================
+// CONNECT ANGEL ONE WEBSOCKET V2
+// ==========================================
 
 export async function connectAngel(onTick, onStatus) {
   if (!session) {
@@ -88,8 +122,12 @@ export async function connectAngel(onTick, onStatus) {
     try {
       ws.close();
     } catch (error) {
-      console.warn('[Angel One] Previous socket close warning:', error.message);
+      console.warn(
+        '[Angel One] Previous socket close warning:',
+        error.message
+      );
     }
+
     ws = null;
   }
 
@@ -107,7 +145,11 @@ export async function connectAngel(onTick, onStatus) {
   });
 
   ws.on('error', (error) => {
-    console.error('[Angel One] WebSocket error:', error);
+    console.error(
+      '[Angel One] WebSocket error:',
+      error
+    );
+
     onStatus({
       connected: false,
       error: error?.message || String(error),
@@ -116,7 +158,8 @@ export async function connectAngel(onTick, onStatus) {
   });
 
   ws.on('close', () => {
-    console.warn('[Angel One] WebSocket closed');
+    console.warn('[Angel One] WebSocket disconnected');
+
     onStatus({
       connected: false,
       phase: 'disconnected'
@@ -134,8 +177,12 @@ export async function connectAngel(onTick, onStatus) {
     });
 
     return ws;
+
   } catch (error) {
-    console.error('[Angel One] WebSocket connection failed:', error);
+    console.error(
+      '[Angel One] WebSocket connection failed:',
+      error
+    );
 
     onStatus({
       connected: false,
@@ -147,13 +194,21 @@ export async function connectAngel(onTick, onStatus) {
   }
 }
 
+// ==========================================
+// SUBSCRIBE MARKET INSTRUMENTS
+// ==========================================
+
 export function subscribeAngel(list) {
   if (!ws) {
-    throw new Error('Angel One WebSocket is not connected.');
+    throw new Error(
+      'Angel One WebSocket is not connected.'
+    );
   }
 
   if (!Array.isArray(list) || list.length === 0) {
-    throw new Error('No instruments supplied for subscription.');
+    throw new Error(
+      'No instruments supplied for subscription.'
+    );
   }
 
   const groups = new Map();
@@ -162,14 +217,30 @@ export function subscribeAngel(list) {
     const exchangeType = Number(item.exchangeType);
     const token = String(item.token);
 
-    if (!groups.has(exchangeType)) {
-      groups.set(exchangeType, []);
+    if (!Number.isInteger(exchangeType) || !token || token === 'undefined') {
+      console.warn(
+        '[Angel One] Skipping invalid instrument:',
+        item
+      );
+      continue;
     }
 
-    groups.get(exchangeType).push(token);
+    if (!groups.has(exchangeType)) {
+      groups.set(exchangeType, new Set());
+    }
+
+    groups.get(exchangeType).add(token);
   }
 
-  for (const [exchangeType, tokens] of groups.entries()) {
+  let totalSubscribed = 0;
+
+  for (const [exchangeType, tokenSet] of groups.entries()) {
+    const tokens = [...tokenSet];
+
+    if (tokens.length === 0) {
+      continue;
+    }
+
     const request = {
       correlationID: `tradepulse-${exchangeType}`,
       action: 1,
@@ -183,24 +254,39 @@ export function subscribeAngel(list) {
     );
 
     ws.fetchData(request);
+
+    totalSubscribed += tokens.length;
   }
 
+  console.log(
+    `[Angel One] Total subscription requests sent: ${totalSubscribed}`
+  );
+
   return {
-    subscribed: list.length,
+    subscribed: totalSubscribed,
     groups: groups.size
   };
 }
+
+// ==========================================
+// DISCONNECT
+// ==========================================
 
 export function disconnectAngel() {
   if (ws) {
     try {
       ws.close();
     } catch (error) {
-      console.warn('[Angel One] Socket close warning:', error.message);
+      console.warn(
+        '[Angel One] Socket close warning:',
+        error.message
+      );
     }
   }
 
   ws = null;
   session = null;
   smartApi = null;
+
+  console.log('[Angel One] Disconnected');
 }

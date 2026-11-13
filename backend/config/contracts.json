@@ -1,3 +1,4 @@
+
 {
   "indices": {
     "NIFTY": {
@@ -12,7 +13,7 @@
     },
     "BANKNIFTY": {
       "exchange": "NSE",
-      "exchangeType": 2,
+      "exchangeType": 1,
       "spot": {
         "token": "",
         "symbol": "NIFTY BANK"
@@ -22,7 +23,7 @@
     },
     "SENSEX": {
       "exchange": "BSE",
-      "exchangeType": 4,
+      "exchangeType": 3,
       "spot": {
         "token": "",
         "symbol": "SENSEX"
@@ -30,6 +31,5 @@
       "options": [],
       "futures": []
     }
-  },
-  "_instructions": "Populate token, exchangeType, expiry, strike, optionType, tradingSymbol and lotSize from the current Angel One instrument master. Verify exchangeType against current SmartAPI docs."
+  }
 }

@@ -21,6 +21,9 @@ const latest = new Map();
 const clients = new Set();
 const lastPersist = new Map();
 
+// Canonical token -> instrument information
+let tokenLookup = new Map();
+
 let contracts = { indices: {} };
 let socket = null;
 
@@ -31,8 +34,28 @@ const diagnostics = {
   lastTickAt: null
 };
 
-const keyOf = c =>
-  `${c.indexName}:${c.segment}:${c.token}`;
+// =====================================================
+// TOKEN NORMALIZATION
+// =====================================================
+
+function normalizeToken(value) {
+  if (value === undefined || value === null) {
+    return '';
+  }
+
+  return String(value)
+    .replace(/\0/g, '')
+    .replace(/^['"]+|['"]+$/g, '')
+    .trim();
+}
+
+function keyOf(instrument) {
+  return `${instrument.indexName}:${instrument.segment}:${normalizeToken(instrument.token)}`;
+}
+
+// =====================================================
+// DASHBOARD CLIENTS
+// =====================================================
 
 function emit(payload) {
   const message = JSON.stringify(payload);
@@ -47,10 +70,6 @@ function emit(payload) {
     }
   }
 }
-
-// =====================================================
-// DASHBOARD WEBSOCKET CLIENTS
-// =====================================================
 
 export function addClient(ws) {
   clients.add(ws);
@@ -69,7 +88,7 @@ export function addClient(ws) {
 }
 
 // =====================================================
-// SMARTAPI PRICE NORMALIZATION
+// NUMBER AND PRICE NORMALIZATION
 // =====================================================
 
 function readNumber(value) {
@@ -83,60 +102,95 @@ function readNumber(value) {
 }
 
 function normalizePrice(raw) {
-  // SmartAPI WebSocket V2 sends last_traded_price
-  // in paise. Convert it into rupees.
-  if (raw.last_traded_price !== undefined &&
-      raw.last_traded_price !== null) {
-    const value = readNumber(raw.last_traded_price);
-    return value === null ? null : value / 100;
+  const paisePrice = readNumber(raw.last_traded_price);
+
+  if (paisePrice !== null) {
+    return paisePrice / 100;
   }
 
-  // Fallback fields are treated as already normalized
-  // rupee values.
   const fallback = readNumber(
-    raw.ltp ?? raw.lastTradedPrice
+    raw.ltp ?? raw.lastTradedPrice ?? raw.last_traded_price_rupees
   );
 
   return fallback;
 }
 
 // =====================================================
-// NORMALIZE INCOMING TICK
+// UNWRAP SDK TICK OBJECTS
 // =====================================================
 
-function normalize(raw) {
-  if (Buffer.isBuffer(raw) || raw instanceof ArrayBuffer) {
-    console.warn('[feed] Received undecoded binary tick');
-    return null;
-  }
-
+function unwrapTick(raw) {
   if (!raw || typeof raw !== 'object') {
     return null;
   }
 
-  const token = String(
-    raw.token ??
-    raw.symbolToken ??
-    raw.symboltoken ??
-    ''
+  if (Buffer.isBuffer(raw) || raw instanceof ArrayBuffer) {
+    console.warn('[TradePulse] Binary tick received instead of parsed object');
+    return null;
+  }
+
+  // Direct Angel One SDK parsed tick.
+  if (
+    raw.token !== undefined ||
+    raw.symbolToken !== undefined ||
+    raw.symboltoken !== undefined
+  ) {
+    return raw;
+  }
+
+  // Some wrappers place the tick inside data.
+  if (raw.data && typeof raw.data === 'object') {
+    if (Array.isArray(raw.data)) {
+      return null;
+    }
+
+    return unwrapTick(raw.data);
+  }
+
+  // Some wrappers use payload.
+  if (raw.payload && typeof raw.payload === 'object') {
+    return unwrapTick(raw.payload);
+  }
+
+  return null;
+}
+
+// =====================================================
+// NORMALIZE INCOMING ANGEL ONE TICK
+// =====================================================
+
+function normalize(raw) {
+  const tick = unwrapTick(raw);
+
+  if (!tick) {
+    return null;
+  }
+
+  const token = normalizeToken(
+    tick.token ??
+    tick.symbolToken ??
+    tick.symboltoken ??
+    tick.instrument_token ??
+    tick.instrumentToken
   );
 
-  const ltp = normalizePrice(raw);
+  const ltp = normalizePrice(tick);
 
-  if (!token || ltp === null || ltp < 0) {
+  if (!token || ltp === null || ltp <= 0) {
     return null;
   }
 
   const oi = readNumber(
-    raw.open_interest ??
-    raw.openInterest ??
-    raw.oi
+    tick.open_interest ??
+    tick.openInterest ??
+    tick.oi
   );
 
   const volume = readNumber(
-    raw.volume_trade_for_the_day ??
-    raw.volume ??
-    raw.volumeTraded
+    tick.volume_trade_for_the_day ??
+    tick.volumeTradedToday ??
+    tick.volume ??
+    tick.volumeTraded
   );
 
   return {
@@ -144,56 +198,84 @@ function normalize(raw) {
     ltp,
     oi,
     volume,
+    exchangeType: readNumber(
+      tick.exchange_type ??
+      tick.exchangeType
+    ),
     exchangeTime:
-      raw.exchange_timestamp ??
-      raw.exchangeTime ??
-      raw.exchangeTimestamp ??
-      null
+      tick.exchange_timestamp ??
+      tick.exchangeTime ??
+      tick.exchangeTimestamp ??
+      null,
+    rawTick: tick
   };
 }
 
 // =====================================================
-// FIND CONTRACT BY TOKEN
+// BUILD TOKEN LOOKUP
 // =====================================================
 
-function findInstrument(token) {
-  for (const [indexName, index] of
-    Object.entries(contracts.indices || {})) {
+function buildTokenLookup() {
+  const lookup = new Map();
 
-    for (const [field, segment] of [
-      ['options', 'option'],
-      ['futures', 'future']
-    ]) {
-      const instrument = (index[field] || []).find(
-        item => String(item.token) === token
-      );
-
-      if (instrument) {
-        return {
-          ...instrument,
-          indexName,
-          segment
-        };
+  for (const [indexName, index] of Object.entries(
+    contracts.indices || {}
+  )) {
+    const add = (instrument, segment) => {
+      if (!instrument?.token) {
+        return;
       }
+
+      const token = normalizeToken(instrument.token);
+
+      if (!token) {
+        return;
+      }
+
+      lookup.set(token, {
+        ...instrument,
+        token,
+        indexName,
+        segment
+      });
+    };
+
+    add(index.spot, 'spot');
+
+    for (const option of index.options || []) {
+      add(option, 'option');
     }
 
-    if (String(index.spot?.token || '') === token) {
-      return {
-        ...index.spot,
-        indexName,
-        segment: 'spot'
-      };
+    for (const future of index.futures || []) {
+      add(future, 'future');
     }
   }
 
-  return null;
+  tokenLookup = lookup;
+
+  console.log(
+    `[TradePulse] Token lookup built: ${tokenLookup.size} instruments`
+  );
+
+  if (tokenLookup.size) {
+    console.log(
+      '[TradePulse] Sample lookup tokens:',
+      [...tokenLookup.keys()].slice(0, 10)
+    );
+  }
+
+  return tokenLookup;
+}
+
+function findInstrument(token) {
+  return tokenLookup.get(normalizeToken(token)) || null;
 }
 
 // =====================================================
-// PROCESS LIVE TICK
+// PROCESS A SINGLE TICK
 // =====================================================
 
-async function onTick(raw) {
+async function processSingleTick(raw) {
   diagnostics.received++;
 
   const normalized = normalize(raw);
@@ -205,25 +287,20 @@ async function onTick(raw) {
   const instrument = findInstrument(normalized.token);
 
   if (!instrument) {
-  diagnostics.unmatched++;
+    diagnostics.unmatched++;
 
-  if (diagnostics.unmatched <= 10) {
-    console.error('[TradePulse DEBUG] Unmatched token:', {
-      token: normalized.token,
-      tokenType: typeof normalized.token,
-      rawTick: JSON.stringify(raw).slice(0, 1000),
-      knownTokens: Object.values(contracts.indices)
-        .flatMap(index => [
-          index.spot?.token,
-          ...(index.options || []).map(x => x.token),
-          ...(index.futures || []).map(x => x.token)
-        ])
-        .slice(0, 10)
-    });
+    // Log only a few samples to avoid flooding Render logs.
+    if (diagnostics.unmatched <= 5) {
+      console.warn('[TradePulse DEBUG] Unmatched tick:', {
+        token: normalized.token,
+        exchangeType: normalized.exchangeType,
+        knownTokenCount: tokenLookup.size,
+        rawTick: JSON.stringify(normalized.rawTick).slice(0, 1200)
+      });
+    }
+
+    return;
   }
-
-  return;
-}
 
   const key = keyOf({
     ...instrument,
@@ -232,8 +309,6 @@ async function onTick(raw) {
 
   const old = latest.get(key);
 
-  // Preserve previous OI and volume if the incoming
-  // tick does not contain those fields.
   const currentOi =
     normalized.oi !== null
       ? normalized.oi
@@ -252,9 +327,11 @@ async function onTick(raw) {
     ? currentOi - old.oi
     : 0;
 
-  const spotKey =
-    `${instrument.indexName}:spot:` +
-    `${contracts.indices[instrument.indexName]?.spot?.token || ''}`;
+  const spotKey = keyOf({
+    indexName: instrument.indexName,
+    segment: 'spot',
+    token: contracts.indices[instrument.indexName]?.spot?.token
+  });
 
   const spotTick = latest.get(spotKey);
 
@@ -270,25 +347,35 @@ async function onTick(raw) {
     ? classifyOi(priceChange, oiChange)
     : 'Insufficient data';
 
-  const greeks =
+  let greeks = null;
+
+  if (
     instrument.segment === 'option' &&
     spot &&
     instrument.expiry
-      ? calculateGreeks({
-          type: instrument.optionType,
-          spot,
-          strike: Number(instrument.strike),
-          premium: normalized.ltp,
-          expiry: instrument.expiry,
-          riskFreeRate: config.riskFreeRate
-        })
-      : null;
+  ) {
+    try {
+      greeks = calculateGreeks({
+        type: instrument.optionType,
+        spot,
+        strike: Number(instrument.strike),
+        premium: normalized.ltp,
+        expiry: instrument.expiry,
+        riskFreeRate: config.riskFreeRate
+      });
+    } catch (error) {
+      console.error('[TradePulse] Greeks calculation error:', error.message);
+    }
+  }
 
   const tick = {
     ...normalized,
     ...instrument,
 
     key,
+    token: normalized.token,
+
+    ltp: normalized.ltp,
     oi: currentOi,
     volume: currentVolume,
 
@@ -302,14 +389,30 @@ async function onTick(raw) {
     receivedAt: new Date().toISOString()
   };
 
+  // Do not store raw SDK object in the dashboard or database.
+  delete tick.rawTick;
+
   latest.set(key, tick);
 
   diagnostics.matchedInstruments = latest.size;
   diagnostics.lastTickAt = tick.receivedAt;
 
-  // =================================================
+  // Log first few successful matches.
+  if (diagnostics.matchedInstruments <= 5) {
+    console.log('[TradePulse] Matched instrument:', {
+      index: instrument.indexName,
+      segment: instrument.segment,
+      token: normalized.token,
+      symbol: instrument.tradingSymbol,
+      ltp: normalized.ltp,
+      oi: currentOi,
+      volume: currentVolume
+    });
+  }
+
+  // ===================================================
   // DATABASE TICK STORAGE
-  // =================================================
+  // ===================================================
 
   const now = Date.now();
   const lastSaved = lastPersist.get(key) || 0;
@@ -325,9 +428,9 @@ async function onTick(raw) {
     });
   }
 
-  // =================================================
+  // ===================================================
   // OI SNAPSHOT STORAGE
-  // =================================================
+  // ===================================================
 
   if (
     old &&
@@ -341,9 +444,9 @@ async function onTick(raw) {
     });
   }
 
-  // =================================================
+  // ===================================================
   // LIVE DASHBOARD UPDATE
-  // =================================================
+  // ===================================================
 
   emit({
     type: 'tick',
@@ -354,6 +457,26 @@ async function onTick(raw) {
     type: 'dashboard',
     data: getDashboard()
   });
+}
+
+// =====================================================
+// HANDLE TICK EVENTS
+// =====================================================
+
+async function onTick(raw) {
+  try {
+    // Support an array of parsed ticks.
+    if (Array.isArray(raw)) {
+      for (const item of raw) {
+        await processSingleTick(item);
+      }
+      return;
+    }
+
+    await processSingleTick(raw);
+  } catch (error) {
+    console.error('[TradePulse] Tick processing error:', error);
+  }
 }
 
 // =====================================================
@@ -489,8 +612,7 @@ export async function startMarketEngine(
     getLtp: getAngelLtp
   });
 
-  // Clear previous in-memory market data when rebuilding
-  // the subscriptions.
+  // Reset old market state.
   latest.clear();
   lastPersist.clear();
 
@@ -499,22 +621,26 @@ export async function startMarketEngine(
   diagnostics.matchedInstruments = 0;
   diagnostics.lastTickAt = null;
 
+  // Build exact token lookup before connecting.
+  buildTokenLookup();
+
   const groups = new Map();
 
-  for (const index of Object.values(contracts.indices)) {
+  for (const index of Object.values(contracts.indices || {})) {
     const instruments = [
-      { ...index.spot },
+      ...(index.spot ? [index.spot] : []),
       ...(index.options || []),
       ...(index.futures || [])
     ];
 
     for (const instrument of instruments) {
       const exchangeType = Number(instrument.exchangeType);
-      const token = String(instrument.token || '');
+      const token = normalizeToken(instrument.token);
 
       if (
         !Number.isInteger(exchangeType) ||
         exchangeType < 1 ||
+        exchangeType > 5 ||
         !token
       ) {
         continue;
@@ -556,7 +682,7 @@ export async function startMarketEngine(
 
   socket = await connectAngel(onTick, onStatus);
 
-  subscribeAngel(subscriptions);
+  const sent = subscribeAngel(subscriptions);
 
   onStatus({
     connected: true,
@@ -568,7 +694,7 @@ export async function startMarketEngine(
   });
 
   console.log(
-    `[TradePulse] Live subscriptions sent: ${total}`
+    `[TradePulse] Live subscriptions sent: ${sent}`
   );
 
   emit({

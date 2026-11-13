@@ -13,6 +13,10 @@ import {
 } from './angel.js';
 import { buildContracts } from './instruments.js';
 
+// =====================================================
+// TRADEPULSE LIVE MARKET ENGINE
+// =====================================================
+
 const latest = new Map();
 const clients = new Set();
 const lastPersist = new Map();
@@ -20,9 +24,12 @@ const lastPersist = new Map();
 let contracts = { indices: {} };
 let socket = null;
 
-let receivedTicks = 0;
-let unmatchedTicks = 0;
-let lastTickAt = null;
+const diagnostics = {
+  received: 0,
+  unmatched: 0,
+  matchedInstruments: 0,
+  lastTickAt: null
+};
 
 const keyOf = c =>
   `${c.indexName}:${c.segment}:${c.token}`;
@@ -32,10 +39,18 @@ function emit(payload) {
 
   for (const client of clients) {
     if (client.readyState === 1) {
-      client.send(message);
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('[WebSocket] Send error:', error.message);
+      }
     }
   }
 }
+
+// =====================================================
+// DASHBOARD WEBSOCKET CLIENTS
+// =====================================================
 
 export function addClient(ws) {
   clients.add(ws);
@@ -46,100 +61,125 @@ export function addClient(ws) {
   }));
 
   ws.on('close', () => clients.delete(ws));
+
+  ws.on('error', error => {
+    console.error('[WebSocket] Client error:', error.message);
+    clients.delete(ws);
+  });
 }
 
-// ==========================================
-// NORMALIZE ANGEL ONE TICK
-// ==========================================
+// =====================================================
+// SMARTAPI PRICE NORMALIZATION
+// =====================================================
+
+function readNumber(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+
+  const number = Number(value);
+
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizePrice(raw) {
+  // SmartAPI WebSocket V2 sends last_traded_price
+  // in paise. Convert it into rupees.
+  if (raw.last_traded_price !== undefined &&
+      raw.last_traded_price !== null) {
+    const value = readNumber(raw.last_traded_price);
+    return value === null ? null : value / 100;
+  }
+
+  // Fallback fields are treated as already normalized
+  // rupee values.
+  const fallback = readNumber(
+    raw.ltp ?? raw.lastTradedPrice
+  );
+
+  return fallback;
+}
+
+// =====================================================
+// NORMALIZE INCOMING TICK
+// =====================================================
 
 function normalize(raw) {
+  if (Buffer.isBuffer(raw) || raw instanceof ArrayBuffer) {
+    console.warn('[feed] Received undecoded binary tick');
+    return null;
+  }
+
   if (!raw || typeof raw !== 'object') {
     return null;
   }
 
-  if (Buffer.isBuffer(raw) || raw instanceof ArrayBuffer) {
-    console.warn(
-      '[feed] Raw binary message received instead of parsed tick object'
-    );
-    return null;
-  }
-
-  // Angel One SDK may return token as:
-  // "\"99926000\""
-  // Remove surrounding quotation marks and null characters.
   const token = String(
     raw.token ??
     raw.symbolToken ??
     raw.symboltoken ??
     ''
-  )
-    .replace(/^["']|["']$/g, '')
-    .replace(/\0/g, '')
-    .trim();
-
-  const rawPrice = Number(
-    raw.last_traded_price ??
-    raw.ltp ??
-    raw.lastTradedPrice
   );
 
-  if (!token || !Number.isFinite(rawPrice) || rawPrice <= 0) {
+  const ltp = normalizePrice(raw);
+
+  if (!token || ltp === null || ltp < 0) {
     return null;
   }
 
-  // Angel One prices are generally transmitted in paise.
-  const ltp = rawPrice > 100000
-    ? rawPrice / 100
-    : rawPrice;
+  const oi = readNumber(
+    raw.open_interest ??
+    raw.openInterest ??
+    raw.oi
+  );
+
+  const volume = readNumber(
+    raw.volume_trade_for_the_day ??
+    raw.volume ??
+    raw.volumeTraded
+  );
 
   return {
     token,
     ltp,
-    oi: Number(
-      raw.open_interest ??
-      raw.openInterest ??
-      raw.oi ??
-      0
-    ),
-    volume: Number(
-      raw.vol_traded ??
-      raw.volume_trade_for_the_day ??
-      raw.volume ??
-      0
-    ),
+    oi,
+    volume,
     exchangeTime:
       raw.exchange_timestamp ??
       raw.exchangeTime ??
+      raw.exchangeTimestamp ??
       null
   };
 }
 
-// ==========================================
+// =====================================================
 // FIND CONTRACT BY TOKEN
-// ==========================================
+// =====================================================
 
-function find(token) {
-  for (const [indexName, idx] of Object.entries(contracts.indices)) {
+function findInstrument(token) {
+  for (const [indexName, index] of
+    Object.entries(contracts.indices || {})) {
+
     for (const [field, segment] of [
       ['options', 'option'],
       ['futures', 'future']
     ]) {
-      const contract = (idx[field] || []).find(
+      const instrument = (index[field] || []).find(
         item => String(item.token) === token
       );
 
-      if (contract) {
+      if (instrument) {
         return {
-          ...contract,
+          ...instrument,
           indexName,
           segment
         };
       }
     }
 
-    if (String(idx.spot?.token || '') === token) {
+    if (String(index.spot?.token || '') === token) {
       return {
-        ...idx.spot,
+        ...index.spot,
         indexName,
         segment: 'spot'
       };
@@ -149,133 +189,145 @@ function find(token) {
   return null;
 }
 
-// ==========================================
+// =====================================================
 // PROCESS LIVE TICK
-// ==========================================
+// =====================================================
 
 async function onTick(raw) {
-  receivedTicks++;
+  diagnostics.received++;
 
   const normalized = normalize(raw);
 
   if (!normalized) {
-    if (receivedTicks <= 10) {
-      console.warn(
-        '[feed] Tick could not be normalized:',
-        JSON.stringify(raw).slice(0, 500)
-      );
-    }
     return;
   }
 
-  const contract = find(normalized.token);
+  const instrument = findInstrument(normalized.token);
 
-  if (!contract) {
-    unmatchedTicks++;
-
-    if (unmatchedTicks <= 10) {
-      console.warn(
-        `[feed] Received unknown token: ${normalized.token}`
-      );
-    }
-
+  if (!instrument) {
+    diagnostics.unmatched++;
     return;
   }
-
-  lastTickAt = new Date().toISOString();
 
   const key = keyOf({
-    ...contract,
+    ...instrument,
     token: normalized.token
   });
 
   const old = latest.get(key);
+
+  // Preserve previous OI and volume if the incoming
+  // tick does not contain those fields.
+  const currentOi =
+    normalized.oi !== null
+      ? normalized.oi
+      : (old?.oi ?? 0);
+
+  const currentVolume =
+    normalized.volume !== null
+      ? normalized.volume
+      : (old?.volume ?? 0);
 
   const priceChange = old
     ? normalized.ltp - old.ltp
     : 0;
 
   const oiChange = old
-    ? normalized.oi - old.oi
+    ? currentOi - old.oi
     : 0;
 
   const spotKey =
-    `${contract.indexName}:spot:${contracts.indices[contract.indexName]?.spot?.token || ''}`;
+    `${instrument.indexName}:spot:` +
+    `${contracts.indices[instrument.indexName]?.spot?.token || ''}`;
 
   const spotTick = latest.get(spotKey);
 
-  const spot = contract.segment === 'spot'
+  const spot = instrument.segment === 'spot'
     ? normalized.ltp
     : (
-        spotTick?.ltp ||
-        contracts.indices[contract.indexName]?.spotPrice ||
+        spotTick?.ltp ??
+        contracts.indices[instrument.indexName]?.spotPrice ??
         null
       );
 
+  const classification = old
+    ? classifyOi(priceChange, oiChange)
+    : 'Insufficient data';
+
+  const greeks =
+    instrument.segment === 'option' &&
+    spot &&
+    instrument.expiry
+      ? calculateGreeks({
+          type: instrument.optionType,
+          spot,
+          strike: Number(instrument.strike),
+          premium: normalized.ltp,
+          expiry: instrument.expiry,
+          riskFreeRate: config.riskFreeRate
+        })
+      : null;
+
   const tick = {
     ...normalized,
-    ...contract,
+    ...instrument,
+
     key,
+    oi: currentOi,
+    volume: currentVolume,
+
     priceChange,
     oiChange,
-
-    classification: old
-      ? classifyOi(priceChange, oiChange)
-      : 'Insufficient data',
+    classification,
 
     spot,
+    greeks,
 
-    greeks:
-      contract.segment === 'option' &&
-      spot &&
-      contract.expiry
-        ? calculateGreeks({
-            type: contract.optionType,
-            spot,
-            strike: Number(contract.strike),
-            premium: normalized.ltp,
-            expiry: contract.expiry,
-            riskFreeRate: config.riskFreeRate
-          })
-        : null,
-
-    receivedAt: lastTickAt
+    receivedAt: new Date().toISOString()
   };
 
   latest.set(key, tick);
 
-  // Log the first five matched ticks for verification.
-  if (latest.size <= 5) {
-    console.log(
-      `[feed] Matched tick: ${contract.indexName} ${contract.segment} ${normalized.token} LTP=${normalized.ltp} OI=${normalized.oi}`
-    );
+  diagnostics.matchedInstruments = latest.size;
+  diagnostics.lastTickAt = tick.receivedAt;
+
+  // =================================================
+  // DATABASE TICK STORAGE
+  // =================================================
+
+  const now = Date.now();
+  const lastSaved = lastPersist.get(key) || 0;
+
+  if (now - lastSaved >= config.tickPersistIntervalMs) {
+    lastPersist.set(key, now);
+
+    saveTick(tick).catch(error => {
+      console.error(
+        '[Database] Tick persistence error:',
+        error.message
+      );
+    });
   }
 
-  // Persist tick snapshots.
+  // =================================================
+  // OI SNAPSHOT STORAGE
+  // =================================================
+
   if (
-    Date.now() -
-    (lastPersist.get(key) || 0) >=
-    config.tickPersistIntervalMs
+    old &&
+    (priceChange !== 0 || oiChange !== 0)
   ) {
-    lastPersist.set(key, Date.now());
-
-    await saveTick(tick).catch(error => {
+    saveOiSnapshot(tick).catch(error => {
       console.error(
-        '[database] Tick persistence failed:',
+        '[Database] OI snapshot error:',
         error.message
       );
     });
   }
 
-  // Save OI changes after a previous tick exists.
-  if (old && (priceChange !== 0 || oiChange !== 0)) {
-    await saveOiSnapshot(tick).catch(error => {
-      console.error(
-        '[database] OI persistence failed:',
-        error.message
-      );
-    });
-  }
+  // =================================================
+  // LIVE DASHBOARD UPDATE
+  // =================================================
 
   emit({
     type: 'tick',
@@ -288,9 +340,9 @@ async function onTick(raw) {
   });
 }
 
-// ==========================================
+// =====================================================
 // DASHBOARD DATA
-// ==========================================
+// =====================================================
 
 export function getDashboard() {
   const indices = {};
@@ -318,82 +370,94 @@ export function getDashboard() {
       futures: {}
     };
 
-    for (const row of options) {
-      const side = row.optionType === 'CE'
-        ? 'ce'
-        : 'pe';
+    for (const option of options) {
+      const side =
+        option.optionType === 'CE' ? 'ce' : 'pe';
 
-      groups[side][row.classification] =
-        (groups[side][row.classification] || 0) + 1;
+      const classification = option.classification;
+
+      groups[side][classification] =
+        (groups[side][classification] || 0) + 1;
     }
 
-    for (const row of futures) {
-      groups.futures[row.classification] =
-        (groups.futures[row.classification] || 0) + 1;
+    for (const future of futures) {
+      const classification = future.classification;
+
+      groups.futures[classification] =
+        (groups.futures[classification] || 0) + 1;
     }
 
-    const idx = contracts.indices[name] || {};
+    const index = contracts.indices[name] || {};
+
+    const spotRow = rows.find(
+      item => item.segment === 'spot'
+    );
+
+    const sortedOptions = [...options].sort(
+      (a, b) => Number(a.strike) - Number(b.strike)
+    );
 
     indices[name] = {
       summary: summarizeOptions(options, futures),
 
       groups,
 
-      options: options.sort(
-        (a, b) => Number(a.strike) - Number(b.strike)
-      ),
+      options: sortedOptions,
 
       futures,
 
       spot:
-        rows.find(item => item.segment === 'spot')?.ltp ??
-        idx.spotPrice ??
+        spotRow?.ltp ??
+        index.spotPrice ??
         null,
 
       contracts: {
-        optionExpiry: idx.optionExpiry || null,
-        futureExpiry: idx.futureExpiry || null,
-        optionCount: idx.options?.length || 0,
-        futureCount: idx.futures?.length || 0
+        optionExpiry: index.optionExpiry || null,
+        futureExpiry: index.futureExpiry || null,
+        optionCount: index.options?.length || 0,
+        futureCount: index.futures?.length || 0
       }
     };
   }
 
   return {
     status: 'live-if-connected',
+
     updatedAt: new Date().toISOString(),
-    instrumentGeneratedAt: contracts.generatedAt || null,
+
+    instrumentGeneratedAt:
+      contracts.generatedAt || null,
+
     tickDiagnostics: {
-      received: receivedTicks,
-      unmatched: unmatchedTicks,
-      matchedInstruments: latest.size,
-      lastTickAt
+      received: diagnostics.received,
+      unmatched: diagnostics.unmatched,
+      matchedInstruments: diagnostics.matchedInstruments,
+      lastTickAt: diagnostics.lastTickAt
     },
+
     indices
   };
 }
 
-// ==========================================
+// =====================================================
 // START MARKET ENGINE
-// ==========================================
+// =====================================================
 
-export async function startMarketEngine(onStatus = () => {}) {
+export async function startMarketEngine(
+  onStatus = () => {}
+) {
   if (socket) {
     try {
       socket.close();
-    } catch {
-      // Ignore previous socket close error.
+    } catch (error) {
+      console.warn(
+        '[TradePulse] Previous socket close:',
+        error.message
+      );
     }
 
     socket = null;
   }
-
-  latest.clear();
-  lastPersist.clear();
-
-  receivedTicks = 0;
-  unmatchedTicks = 0;
-  lastTickAt = null;
 
   onStatus({
     connected: false,
@@ -403,31 +467,48 @@ export async function startMarketEngine(onStatus = () => {}) {
     phase: 'loading-instrument-master'
   });
 
-  console.log('[TradePulse] Building market contracts');
+  console.log('[TradePulse] Building live contracts');
 
   contracts = await buildContracts({
     getLtp: getAngelLtp
   });
 
+  // Clear previous in-memory market data when rebuilding
+  // the subscriptions.
+  latest.clear();
+  lastPersist.clear();
+
+  diagnostics.received = 0;
+  diagnostics.unmatched = 0;
+  diagnostics.matchedInstruments = 0;
+  diagnostics.lastTickAt = null;
+
   const groups = new Map();
 
-  for (const idx of Object.values(contracts.indices)) {
+  for (const index of Object.values(contracts.indices)) {
     const instruments = [
-      { ...idx.spot },
-      ...(idx.options || []),
-      ...(idx.futures || [])
+      { ...index.spot },
+      ...(index.options || []),
+      ...(index.futures || [])
     ];
 
     for (const instrument of instruments) {
       const exchangeType = Number(instrument.exchangeType);
+      const token = String(instrument.token || '');
+
+      if (
+        !Number.isInteger(exchangeType) ||
+        exchangeType < 1 ||
+        !token
+      ) {
+        continue;
+      }
 
       if (!groups.has(exchangeType)) {
         groups.set(exchangeType, []);
       }
 
-      groups.get(exchangeType).push(
-        String(instrument.token)
-      );
+      groups.get(exchangeType).push(token);
     }
   }
 
@@ -448,18 +529,16 @@ export async function startMarketEngine(onStatus = () => {}) {
     total > config.maxSubscriptionTokens
   ) {
     throw new Error(
-      `Invalid subscription total ${total}; configured limit ${config.maxSubscriptionTokens}`
+      `Invalid subscription total ${total}; ` +
+      `configured limit ${config.maxSubscriptionTokens}`
     );
   }
 
   console.log(
-    `[TradePulse] Total instruments prepared: ${total}`
+    `[TradePulse] Connecting feed for ${total} instruments`
   );
 
-  socket = await connectAngel(
-    onTick,
-    onStatus
-  );
+  socket = await connectAngel(onTick, onStatus);
 
   subscribeAngel(subscriptions);
 
@@ -472,6 +551,10 @@ export async function startMarketEngine(onStatus = () => {}) {
     instruments: getInstrumentSummary()
   });
 
+  console.log(
+    `[TradePulse] Live subscriptions sent: ${total}`
+  );
+
   emit({
     type: 'dashboard',
     data: getDashboard()
@@ -480,21 +563,21 @@ export async function startMarketEngine(onStatus = () => {}) {
   return socket;
 }
 
-// ==========================================
+// =====================================================
 // INSTRUMENT SUMMARY
-// ==========================================
+// =====================================================
 
 export function getInstrumentSummary() {
   return Object.fromEntries(
     Object.entries(contracts.indices || {}).map(
-      ([name, value]) => [
+      ([name, index]) => [
         name,
         {
-          spot: value.spot?.token || null,
-          optionExpiry: value.optionExpiry || null,
-          futureExpiry: value.futureExpiry || null,
-          options: value.options?.length || 0,
-          futures: value.futures?.length || 0
+          spot: index.spot?.token || null,
+          optionExpiry: index.optionExpiry || null,
+          futureExpiry: index.futureExpiry || null,
+          options: index.options?.length || 0,
+          futures: index.futures?.length || 0
         }
       ]
     )

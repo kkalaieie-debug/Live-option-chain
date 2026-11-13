@@ -159,12 +159,88 @@ function unwrapTick(raw) {
 // NORMALIZE INCOMING ANGEL ONE TICK
 // =====================================================
 
-function normalize(raw) {
-  const tick = unwrapTick(raw);
 
-  if (!tick) {
+function normalize(raw) {
+  if (Buffer.isBuffer(raw) || raw instanceof ArrayBuffer) {
+    console.warn('[feed] Received undecoded binary tick');
     return null;
   }
+
+  if (!raw || typeof raw !== 'object') return null;
+
+  const read = (...values) => {
+    for (const value of values) {
+      if (value !== undefined && value !== null && value !== '') {
+        const n = Number(value);
+        if (Number.isFinite(n)) return n;
+      }
+    }
+    return null;
+  };
+
+  const token = String(
+    raw.token ??
+    raw.symbolToken ??
+    raw.symboltoken ??
+    ''
+  ).replace(/\u0000/g, '').trim();
+
+  // SDK returns last_traded_price in paise.
+  const rawPrice = read(
+    raw.last_traded_price,
+    raw.lastTradedPrice
+  );
+
+  const ltp = rawPrice !== null
+    ? rawPrice / 100
+    : read(raw.ltp);
+
+  if (!token || ltp === null || ltp < 0) return null;
+
+  // JavaScript SDK uses vol_traded for Snap Quote.
+  const oi = read(
+    raw.open_interest,
+    raw.openInterest,
+    raw.opnInterest,
+    raw.oi
+  );
+
+  const volume = read(
+    raw.vol_traded,
+    raw.volume_trade_for_the_day,
+    raw.tradeVolume,
+    raw.volumeTraded,
+    raw.volume
+  );
+
+  const lastTradedQty = read(
+    raw.last_traded_quantity,
+    raw.lastTradedQuantity,
+    raw.lastTradeQty
+  );
+
+  const averagePriceRaw = read(
+    raw.avg_traded_price,
+    raw.average_traded_price,
+    raw.avgTradedPrice
+  );
+
+  return {
+    token,
+    ltp,
+    oi,
+    volume,
+    lastTradedQty,
+    averageTradedPrice:
+      averagePriceRaw === null ? null : averagePriceRaw / 100,
+    exchangeTime:
+      raw.exchange_timestamp ??
+      raw.exchangeTimestamp ??
+      raw.exchangeTime ??
+      null
+  };
+}
+
 
   const token = normalizeToken(
     tick.token ??

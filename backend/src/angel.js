@@ -8,7 +8,7 @@ let ws = null;
 let session = null;
 
 // ==========================================
-// ANGEL ONE LOGIN
+// LOGIN
 // ==========================================
 
 export async function loginAngel() {
@@ -30,7 +30,9 @@ export async function loginAngel() {
   const result = await smartApi.generateSession(clientCode, pin, totp);
 
   if (!result?.status || !result?.data?.jwtToken) {
-    throw new Error(`Angel One login failed: ${result?.message || 'Invalid login response'}`);
+    throw new Error(
+      `Angel One login failed: ${result?.message || 'Invalid login response'}`
+    );
   }
 
   const feedToken = result.data.feedToken;
@@ -47,11 +49,14 @@ export async function loginAngel() {
   console.log('[Angel One] Login successful');
   console.log('[Angel One] Feed token received');
 
-  return { loggedIn: true, feedTokenAvailable: true };
+  return {
+    loggedIn: true,
+    feedTokenAvailable: true
+  };
 }
 
 // ==========================================
-// GET LTP
+// LIVE LTP USING ANGEL ONE MARKET DATA API
 // ==========================================
 
 export async function getAngelLtp(exchange, tradingsymbol, symboltoken) {
@@ -59,21 +64,56 @@ export async function getAngelLtp(exchange, tradingsymbol, symboltoken) {
     throw new Error('Angel One is not logged in.');
   }
 
-  const result = await smartApi.ltpData(
-    exchange,
-    tradingsymbol,
-    String(symboltoken)
-  );
+  try {
+    const result = await smartApi.marketData({
+      mode: 'LTP',
+      exchangeTokens: {
+        [exchange]: [String(symboltoken)]
+      }
+    });
 
-  if (!result?.status) {
-    throw new Error(result?.message || `LTP failed for ${tradingsymbol}`);
+    if (!result?.status) {
+      throw new Error(
+        result?.message || `Market data request failed for ${tradingsymbol}`
+      );
+    }
+
+    const fetched = result?.data?.fetched || [];
+
+    const quote = fetched.find(
+      item => String(item.symbolToken) === String(symboltoken)
+    ) || fetched[0];
+
+    if (!quote || quote.ltp === undefined || quote.ltp === null) {
+      const reason = result?.data?.unfetched?.[0]?.message;
+      throw new Error(
+        reason || `No LTP returned for ${tradingsymbol}`
+      );
+    }
+
+    console.log(
+      `[Angel One] LTP received: ${tradingsymbol} = ${quote.ltp}`
+    );
+
+    // Keep the response format expected by instruments.js
+    return {
+      status: true,
+      message: result.message || 'SUCCESS',
+      data: quote
+    };
+
+  } catch (error) {
+    console.error(
+      `[Angel One] LTP error for ${tradingsymbol}:`,
+      error.message
+    );
+
+    throw error;
   }
-
-  return result;
 }
 
 // ==========================================
-// WEBSOCKET CONNECTION
+// WEBSOCKET V2 CONNECTION
 // ==========================================
 
 export async function connectAngel(onTick, onStatus) {
@@ -87,6 +127,7 @@ export async function connectAngel(onTick, onStatus) {
     } catch (error) {
       console.warn('[Angel One] Previous socket close warning:', error.message);
     }
+
     ws = null;
   }
 
@@ -99,10 +140,13 @@ export async function connectAngel(onTick, onStatus) {
     feedtype: session.feedToken
   });
 
-  ws.on('tick', data => onTick(data));
+  ws.on('tick', data => {
+    onTick(data);
+  });
 
   ws.on('error', error => {
     console.error('[Angel One] WebSocket error:', error);
+
     onStatus({
       connected: false,
       error: error?.message || String(error),
@@ -112,29 +156,41 @@ export async function connectAngel(onTick, onStatus) {
 
   ws.on('close', () => {
     console.warn('[Angel One] WebSocket disconnected');
-    onStatus({ connected: false, phase: 'disconnected' });
+
+    onStatus({
+      connected: false,
+      phase: 'disconnected'
+    });
   });
 
   try {
     await ws.connect();
 
     console.log('[Angel One] WebSocket connected');
-    onStatus({ connected: true, phase: 'connected' });
+
+    onStatus({
+      connected: true,
+      phase: 'connected'
+    });
 
     return ws;
+
   } catch (error) {
     console.error('[Angel One] WebSocket connection failed:', error);
+
     onStatus({
       connected: false,
       error: error?.message || String(error),
       phase: 'connection_failed'
     });
+
     throw error;
   }
 }
 
 // ==========================================
-// SUBSCRIBE - SUPPORTS GROUPED AND FLAT DATA
+// SUBSCRIBE INSTRUMENTS
+// Supports grouped and flat instrument formats
 // ==========================================
 
 export function subscribeAngel(list) {
@@ -166,21 +222,12 @@ export function subscribeAngel(list) {
   for (const item of list) {
     if (!item) continue;
 
-    const exchangeType = item.exchangeType;
-
-    // Engine grouped format:
-    // { exchangeType: 4, tokens: ['123', '456'] }
     if (Array.isArray(item.tokens)) {
       for (const token of item.tokens) {
-        addToken(exchangeType, token);
+        addToken(item.exchangeType, token);
       }
-      continue;
-    }
-
-    // Flat format:
-    // { exchangeType: 4, token: '123' }
-    if (item.token !== undefined) {
-      addToken(exchangeType, item.token);
+    } else if (item.token !== undefined) {
+      addToken(item.exchangeType, item.token);
     }
   }
 

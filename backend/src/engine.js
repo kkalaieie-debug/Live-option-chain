@@ -1,6 +1,12 @@
 
 import { config } from './config.js';
-import { saveTick, saveOiSnapshot } from './db.js';
+import {
+  saveTick,
+  saveOiSnapshot,
+  flushPendingWrites,
+  loadLatestTickBaselines,
+  loadMinuteTickBaselines
+} from './db.js';
 import {
   classifyOi,
   calculateGreeks,
@@ -21,11 +27,13 @@ const latest = new Map();
 const clients = new Set();
 const lastPersist = new Map();
 const lastOiPersist = new Map();
+const minuteBaselines = new Map();
 
 const OI_SNAPSHOT_INTERVAL_MS = 60_000;
 
 let tokenLookup = new Map();
 let fallbackTokenLookup = new Map();
+
 let contracts = { indices: {} };
 let socket = null;
 
@@ -160,7 +168,11 @@ function unwrapTicks(raw) {
     return raw.flatMap(unwrapTicks);
   }
 
-  if (Buffer.isBuffer(raw) || raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) {
+  if (
+    Buffer.isBuffer(raw) ||
+    raw instanceof ArrayBuffer ||
+    ArrayBuffer.isView(raw)
+  ) {
     recordIgnoredPayload('binary_payload', raw);
     return [];
   }
@@ -194,8 +206,11 @@ function unwrapTicks(raw) {
 
 function getInvalidTickReason(raw) {
   const token = normalizeToken(
-    raw?.token ?? raw?.symbolToken ?? raw?.symboltoken ??
-    raw?.instrument_token ?? raw?.instrumentToken
+    raw?.token ??
+    raw?.symbolToken ??
+    raw?.symboltoken ??
+    raw?.instrument_token ??
+    raw?.instrumentToken
   );
 
   if (!token) return 'missing_token';
@@ -205,7 +220,9 @@ function getInvalidTickReason(raw) {
     raw?.lastTradedPrice
   );
 
-  const ltp = rawPrice !== null ? rawPrice / 100 : readNumber(raw?.ltp);
+  const ltp = rawPrice !== null
+    ? rawPrice / 100
+    : readNumber(raw?.ltp);
 
   if (ltp === null) return 'missing_or_non_numeric_price';
   if (ltp <= 0) return 'non_positive_price';
@@ -261,7 +278,6 @@ function normalizeTick(raw) {
     raw.lastTradedPrice
   );
 
-  // Angel One WebSocket V2 prices are in paise.
   const ltp = rawPrice !== null
     ? rawPrice / 100
     : readNumber(raw.ltp);
@@ -368,8 +384,13 @@ function buildTokenLookup() {
   tokenLookup = exactLookup;
   fallbackTokenLookup = tokenOnlyLookup;
 
-  console.log(`[TradePulse] Exact token lookup: ${tokenLookup.size}`);
-  console.log(`[TradePulse] Fallback token lookup: ${fallbackTokenLookup.size}`);
+  console.log(
+    `[TradePulse] Exact token lookup: ${tokenLookup.size}`
+  );
+
+  console.log(
+    `[TradePulse] Fallback token lookup: ${fallbackTokenLookup.size}`
+  );
 
   console.log(
     '[TradePulse] Sample tokens:',
@@ -397,13 +418,21 @@ function findInstrument(tick) {
 
 function persistTick(tick) {
   saveTick(tick).catch(error => {
-    logThrottled('tick-db', '[Database] Tick persistence error:', error);
+    logThrottled(
+      'tick-db',
+      '[Database] Tick persistence error:',
+      error
+    );
   });
 }
 
 function persistOi(tick) {
   saveOiSnapshot(tick).catch(error => {
-    logThrottled('oi-db', '[Database] OI snapshot error:', error);
+    logThrottled(
+      'oi-db',
+      '[Database] OI snapshot error:',
+      error
+    );
   });
 }
 
@@ -446,23 +475,91 @@ async function processSingleTick(raw) {
 
   const old = latest.get(key);
 
-  const currentOi =
-    normalized.oi !== null
-      ? normalized.oi
-      : (old?.oi ?? 0);
+  // Missing OI is unknown, not zero.
+  const currentOi = normalized.oi !== null
+    ? normalized.oi
+    : (old?.oi ?? null);
 
-  const currentVolume =
-    normalized.volume !== null
-      ? normalized.volume
-      : (old?.volume ?? 0);
+  const currentVolume = normalized.volume !== null
+    ? normalized.volume
+    : (old?.volume ?? null);
 
-  const priceChange = old
-    ? normalized.ltp - old.ltp
-    : 0;
+  // Restored rows are not considered fresh live tick baselines.
+  const hasLivePrevious = Boolean(old && !old.isRestored);
 
-  const oiChange = old
-    ? currentOi - old.oi
-    : 0;
+  const tickPriceChange =
+    hasLivePrevious && normalized.ltp !== null && old.ltp !== null
+      ? normalized.ltp - old.ltp
+      : null;
+
+  const tickOiChange =
+    hasLivePrevious && currentOi !== null && old.oi !== null
+      ? currentOi - old.oi
+      : null;
+
+  const tickClassification =
+    tickPriceChange !== null && tickOiChange !== null
+      ? classifyOi(tickPriceChange, tickOiChange)
+      : 'Insufficient data';
+
+  // One-minute comparison baseline.
+  let minuteState = minuteBaselines.get(key);
+
+  if (!minuteState) {
+    minuteState = {
+      baseline: null,
+      classification: 'Insufficient data',
+      oiChange: null,
+      priceChange: null
+    };
+  }
+
+  const now = Date.now();
+
+  if (
+    minuteState.baseline &&
+    now - minuteState.baseline.at >= 60_000
+  ) {
+    const base = minuteState.baseline;
+
+    if (
+      currentOi !== null &&
+      base.oi !== null &&
+      normalized.ltp !== null &&
+      base.ltp !== null
+    ) {
+      minuteState.oiChange = currentOi - base.oi;
+      minuteState.priceChange = normalized.ltp - base.ltp;
+
+      minuteState.classification = classifyOi(
+        minuteState.priceChange,
+        minuteState.oiChange
+      );
+    } else {
+      minuteState.oiChange = null;
+      minuteState.priceChange = null;
+      minuteState.classification = 'Insufficient data';
+    }
+
+    minuteState.baseline = {
+      ltp: normalized.ltp,
+      oi: currentOi,
+      at: now
+    };
+  } else if (!minuteState.baseline) {
+    minuteState.baseline = {
+      ltp: normalized.ltp,
+      oi: currentOi,
+      at: now
+    };
+  }
+
+  minuteBaselines.set(key, minuteState);
+
+  // Keep existing dashboard field names compatible.
+  const priceChange = tickPriceChange;
+  const oiChange = tickOiChange;
+  const classification = tickClassification;
 
   const spotKey = keyOf({
     indexName: instrument.indexName,
@@ -479,10 +576,6 @@ async function processSingleTick(raw) {
         contracts.indices[instrument.indexName]?.spotPrice ??
         null
       );
-
-  const classification = old
-    ? classifyOi(priceChange, oiChange)
-    : 'Insufficient data';
 
   let greeks = null;
 
@@ -501,7 +594,11 @@ async function processSingleTick(raw) {
         riskFreeRate: config.riskFreeRate
       });
     } catch (error) {
-      logThrottled('greeks', '[TradePulse] Greeks calculation error:', error);
+      logThrottled(
+        'greeks',
+        '[TradePulse] Greeks calculation error:',
+        error
+      );
     }
   }
 
@@ -509,6 +606,7 @@ async function processSingleTick(raw) {
     ...normalized,
     ...instrument,
     key,
+    isRestored: false,
     token: normalized.token,
     ltp: normalized.ltp,
     oi: currentOi,
@@ -516,6 +614,12 @@ async function processSingleTick(raw) {
     priceChange,
     oiChange,
     classification,
+    tickPriceChange,
+    tickOiChange,
+    tickClassification,
+    minutePriceChange: minuteState.priceChange,
+    minuteOiChange: minuteState.oiChange,
+    minuteClassification: minuteState.classification,
     spot,
     greeks,
     receivedAt: new Date().toISOString()
@@ -538,7 +642,7 @@ async function processSingleTick(raw) {
     });
   }
 
-  const now = Date.now();
+  // Persist ticks at the configured interval.
   const lastSaved = lastPersist.get(key) || 0;
 
   if (now - lastSaved >= config.tickPersistIntervalMs) {
@@ -546,11 +650,10 @@ async function processSingleTick(raw) {
     persistTick(tick);
   }
 
-  // Save first baseline, changes, and periodic refreshes.
+  // Persist first baseline, changes, and periodic refreshes.
   const lastOiSaved = lastOiPersist.get(key) || 0;
-  const oiChanged = old && (
-    priceChange !== 0 || oiChange !== 0
-  );
+  const oiChanged = hasLivePrevious &&
+    (priceChange !== 0 || oiChange !== 0);
 
   if (
     !old ||
@@ -570,252 +673,4 @@ async function processSingleTick(raw) {
     type: 'dashboard',
     data: getDashboard()
   });
-}
-
-// =====================================================
-// HANDLE ANGEL ONE TICK EVENTS
-// =====================================================
-
-async function onTick(raw) {
-  try {
-    const ticks = unwrapTicks(raw);
-
-    for (const item of ticks) {
-      await processSingleTick(item);
-    }
-  } catch (error) {
-    logThrottled(
-      'tick-processing',
-      '[TradePulse] Tick processing error:',
-      error
-    );
-  }
-}
-
-// =====================================================
-// DASHBOARD
-// =====================================================
-
-export function getDashboard() {
-  const indices = {};
-
-  for (const name of ['NIFTY', 'BANKNIFTY', 'SENSEX']) {
-    const rows = [...latest.values()].filter(
-      item => item.indexName === name
-    );
-
-    const options = rows.filter(
-      item => item.segment === 'option'
-    );
-
-    const futures = rows.filter(
-      item => item.segment === 'future'
-    );
-
-    const groups = {
-      ce: {},
-      pe: {},
-      futures: {}
-    };
-
-    for (const option of options) {
-      const side = option.optionType === 'CE' ? 'ce' : 'pe';
-      const classification = option.classification;
-
-      groups[side][classification] =
-        (groups[side][classification] || 0) + 1;
-    }
-
-    for (const future of futures) {
-      const classification = future.classification;
-
-      groups.futures[classification] =
-        (groups.futures[classification] || 0) + 1;
-    }
-
-    const index = contracts.indices[name] || {};
-
-    const spotRow = rows.find(
-      item => item.segment === 'spot'
-    );
-
-    const sortedOptions = [...options].sort(
-      (a, b) => Number(a.strike) - Number(b.strike)
-    );
-
-    indices[name] = {
-      summary: summarizeOptions(options, futures),
-      groups,
-      options: sortedOptions,
-      futures,
-      spot: spotRow?.ltp ?? index.spotPrice ?? null,
-      contracts: {
-        optionExpiry: index.optionExpiry || null,
-        futureExpiry: index.futureExpiry || null,
-        optionCount: index.options?.length || 0,
-        futureCount: index.futures?.length || 0
-      }
-    };
-  }
-
-  return {
-    status: 'live-if-connected',
-    updatedAt: new Date().toISOString(),
-    instrumentGeneratedAt: contracts.generatedAt || null,
-
-    tickDiagnostics: {
-      received: diagnostics.received,
-      validTicks: diagnostics.validTicks,
-      invalid: diagnostics.invalid,
-      invalidReasons: diagnostics.invalidReasons,
-      ignoredPayloads: diagnostics.ignoredPayloads,
-      ignoredReasons: diagnostics.ignoredReasons,
-      unmatched: diagnostics.unmatched,
-      matchedInstruments: diagnostics.matchedInstruments,
-      lastTickAt: diagnostics.lastTickAt,
-      lastInvalidAt: diagnostics.lastInvalidAt,
-      lastInvalidReason: diagnostics.lastInvalidReason
-    },
-
-    indices
-  };
-}
-
-// =====================================================
-// START MARKET ENGINE
-// =====================================================
-
-export async function startMarketEngine(onStatus = () => {}) {
-  if (socket) {
-    try {
-      socket.close();
-    } catch (error) {
-      console.warn('[TradePulse] Previous socket close:', error.message);
-    }
-
-    socket = null;
-  }
-
-  onStatus({
-    connected: false,
-    started: true,
-    subscribed: 0,
-    error: null,
-    phase: 'loading-instrument-master'
-  });
-
-  console.log('[TradePulse] Building live contracts');
-
-  contracts = await buildContracts({
-    getLtp: getAngelLtp
-  });
-
-  latest.clear();
-  lastPersist.clear();
-  lastOiPersist.clear();
-
-  diagnostics.received = 0;
-  diagnostics.validTicks = 0;
-  diagnostics.invalid = 0;
-  diagnostics.invalidReasons = {};
-  diagnostics.ignoredPayloads = 0;
-  diagnostics.ignoredReasons = {};
-  diagnostics.unmatched = 0;
-  diagnostics.matchedInstruments = 0;
-  diagnostics.lastTickAt = null;
-  diagnostics.lastInvalidAt = null;
-  diagnostics.lastInvalidReason = null;
-
-  buildTokenLookup();
-
-  const groups = new Map();
-
-  for (const index of Object.values(contracts.indices || {})) {
-    const instruments = [
-      ...(index.spot ? [index.spot] : []),
-      ...(index.options || []),
-      ...(index.futures || [])
-    ];
-
-    for (const instrument of instruments) {
-      const exchangeType = Number(instrument.exchangeType);
-      const token = normalizeToken(instrument.token);
-
-      if (!Number.isInteger(exchangeType) || !token) {
-        continue;
-      }
-
-      if (!groups.has(exchangeType)) {
-        groups.set(exchangeType, []);
-      }
-
-      groups.get(exchangeType).push(token);
-    }
-  }
-
-  const subscriptions = [...groups].map(
-    ([exchangeType, tokens]) => ({
-      exchangeType,
-      tokens: [...new Set(tokens)]
-    })
-  );
-
-  const total = subscriptions.reduce(
-    (count, group) => count + group.tokens.length,
-    0
-  );
-
-  if (!total || total > config.maxSubscriptionTokens) {
-    throw new Error(
-      `Invalid subscription total ${total}; ` +
-      `configured limit ${config.maxSubscriptionTokens}`
-    );
-  }
-
-  console.log(
-    `[TradePulse] Connecting feed for ${total} instruments`
-  );
-
-  socket = await connectAngel(onTick, onStatus);
-
-  const sent = subscribeAngel(subscriptions);
-
-  onStatus({
-    connected: true,
-    started: true,
-    subscribed: total,
-    error: null,
-    phase: 'subscribed',
-    instruments: getInstrumentSummary()
-  });
-
-  console.log(`[TradePulse] Live subscriptions sent: ${sent}`);
-
-  emit({
-    type: 'dashboard',
-    data: getDashboard()
-  });
-
-  return socket;
-}
-
-// =====================================================
-// INSTRUMENT SUMMARY
-// =====================================================
-
-export function getInstrumentSummary() {
-  return Object.fromEntries(
-    Object.entries(contracts.indices || {}).map(
-      ([name, index]) => [
-        name,
-        {
-          spot: index.spot?.token || null,
-          optionExpiry: index.optionExpiry || null,
-          futureExpiry: index.futureExpiry || null,
-          options: index.options?.length || 0,
-          futures: index.futures?.length || 0
-        }
-      ]
-    )
-  );
 }

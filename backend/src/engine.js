@@ -674,3 +674,389 @@ async function processSingleTick(raw) {
     data: getDashboard()
   });
 }
+
+// =====================================================
+// HANDLE ANGEL ONE TICK EVENTS
+// =====================================================
+
+async function onTick(raw) {
+  try {
+    const ticks = unwrapTicks(raw);
+
+    for (const item of ticks) {
+      await processSingleTick(item);
+    }
+  } catch (error) {
+    logThrottled(
+      'tick-processing',
+      '[TradePulse] Tick processing error:',
+      error
+    );
+  }
+}
+
+// =====================================================
+// DASHBOARD
+// =====================================================
+
+export function getDashboard() {
+  const indices = {};
+
+  for (const name of ['NIFTY', 'BANKNIFTY', 'SENSEX']) {
+    const rows = [...latest.values()].filter(
+      item => item.indexName === name
+    );
+
+    const options = rows.filter(
+      item => item.segment === 'option'
+    );
+
+    const futures = rows.filter(
+      item => item.segment === 'future'
+    );
+
+    const groups = {
+      ce: {},
+      pe: {},
+      futures: {}
+    };
+
+    for (const option of options) {
+      const side = option.optionType === 'CE' ? 'ce' : 'pe';
+
+      const classification = option.classification;
+
+      groups[side][classification] =
+        (groups[side][classification] || 0) + 1;
+    }
+
+    for (const future of futures) {
+      const classification = future.classification;
+
+      groups.futures[classification] =
+        (groups.futures[classification] || 0) + 1;
+    }
+
+    const index = contracts.indices[name] || {};
+
+    const spotRow = rows.find(
+      item => item.segment === 'spot'
+    );
+
+    const sortedOptions = [...options].sort(
+      (a, b) => Number(a.strike) - Number(b.strike)
+    );
+
+    indices[name] = {
+      summary: summarizeOptions(options, futures),
+      groups,
+      options: sortedOptions,
+      futures,
+      spot: spotRow?.ltp ?? index.spotPrice ?? null,
+      contracts: {
+        optionExpiry: index.optionExpiry || null,
+        futureExpiry: index.futureExpiry || null,
+        optionCount: index.options?.length || 0,
+        futureCount: index.futures?.length || 0
+      }
+    };
+  }
+
+  return {
+    status: 'live-if-connected',
+    updatedAt: new Date().toISOString(),
+    instrumentGeneratedAt: contracts.generatedAt || null,
+
+    tickDiagnostics: {
+      received: diagnostics.received,
+      validTicks: diagnostics.validTicks,
+      invalid: diagnostics.invalid,
+      invalidReasons: diagnostics.invalidReasons,
+      ignoredPayloads: diagnostics.ignoredPayloads,
+      ignoredReasons: diagnostics.ignoredReasons,
+      unmatched: diagnostics.unmatched,
+      matchedInstruments: diagnostics.matchedInstruments,
+      lastTickAt: diagnostics.lastTickAt,
+      lastInvalidAt: diagnostics.lastInvalidAt,
+      lastInvalidReason: diagnostics.lastInvalidReason
+    },
+
+    indices
+  };
+}
+
+// =====================================================
+// RESTORE DATABASE BASELINES
+// =====================================================
+
+function findInstrumentByKey(key) {
+  for (const instrument of tokenLookup.values()) {
+    if (keyOf(instrument) === key) {
+      return instrument;
+    }
+  }
+
+  return null;
+}
+
+function restoreTickRow(row, isRestored = true) {
+  const key = row.instrument_key;
+
+  const instrument = findInstrumentByKey(key);
+
+  if (!instrument) return null;
+
+  const receivedAt = new Date(row.received_at).getTime();
+
+  if (!Number.isFinite(receivedAt)) return null;
+
+  const tick = {
+    ...instrument,
+    key,
+    token: instrument.token,
+    ltp: readNumber(row.ltp),
+    oi: readNumber(row.oi),
+    volume: readNumber(row.volume),
+    priceChange: null,
+    oiChange: null,
+    classification: 'Insufficient data',
+    tickPriceChange: null,
+    tickOiChange: null,
+    tickClassification: 'Insufficient data',
+    minutePriceChange: null,
+    minuteOiChange: null,
+    minuteClassification: 'Insufficient data',
+    spot: null,
+    greeks: null,
+    receivedAt: new Date(receivedAt).toISOString(),
+    isRestored
+  };
+
+  return tick;
+}
+
+async function restoreDatabaseBaselines() {
+  if (!config.databaseUrl) {
+    console.warn('[TradePulse] Database unavailable; starting without restored baselines.');
+    return;
+  }
+
+  try {
+    // Ensure queued writes from before the restore are flushed first.
+    await flushPendingWrites();
+
+    const indexNames = ['NIFTY', 'BANKNIFTY', 'SENSEX'];
+
+    const [latestRows, minuteRows] = await Promise.all([
+      loadLatestTickBaselines(indexNames),
+      loadMinuteTickBaselines(indexNames)
+    ]);
+
+    let restoredLatest = 0;
+    let restoredMinute = 0;
+
+    for (const row of latestRows) {
+      const tick = restoreTickRow(row, true);
+
+      if (!tick) continue;
+
+      latest.set(tick.key, tick);
+      restoredLatest++;
+    }
+
+    for (const row of minuteRows) {
+      const key = row.instrument_key;
+      const ltp = readNumber(row.ltp);
+      const oi = readNumber(row.oi);
+      const at = new Date(row.received_at).getTime();
+
+      if (
+        !key ||
+        ltp === null ||
+        !Number.isFinite(at)
+      ) {
+        continue;
+      }
+
+      minuteBaselines.set(key, {
+        baseline: {
+          ltp,
+          oi,
+          at
+        },
+        classification: 'Insufficient data',
+        oiChange: null,
+        priceChange: null
+      });
+
+      restoredMinute++;
+    }
+
+    diagnostics.matchedInstruments = latest.size;
+
+    console.log('[TradePulse] Database baselines restored:', {
+      latest: restoredLatest,
+      minute: restoredMinute
+    });
+  } catch (error) {
+    logThrottled(
+      'baseline-restore',
+      '[TradePulse] Database baseline restore failed:',
+      error
+    );
+  }
+}
+
+// =====================================================
+// START MARKET ENGINE
+// =====================================================
+
+export async function startMarketEngine(onStatus = () => {}) {
+  if (socket) {
+    try {
+      socket.close();
+    } catch (error) {
+      console.warn(
+        '[TradePulse] Previous socket close:',
+        error.message
+      );
+    }
+
+    socket = null;
+  }
+
+  onStatus({
+    connected: false,
+    started: true,
+    subscribed: 0,
+    error: null,
+    phase: 'loading-instrument-master'
+  });
+
+  console.log('[TradePulse] Building live contracts');
+
+  contracts = await buildContracts({
+    getLtp: getAngelLtp
+  });
+
+  latest.clear();
+  lastPersist.clear();
+  lastOiPersist.clear();
+  minuteBaselines.clear();
+
+  diagnostics.received = 0;
+  diagnostics.validTicks = 0;
+  diagnostics.invalid = 0;
+  diagnostics.invalidReasons = {};
+  diagnostics.ignoredPayloads = 0;
+  diagnostics.ignoredReasons = {};
+  diagnostics.unmatched = 0;
+  diagnostics.matchedInstruments = 0;
+  diagnostics.lastTickAt = null;
+  diagnostics.lastInvalidAt = null;
+  diagnostics.lastInvalidReason = null;
+
+  buildTokenLookup();
+
+  // Restore history after current contracts are known.
+  await restoreDatabaseBaselines();
+
+  const groups = new Map();
+
+  for (const index of Object.values(contracts.indices || {})) {
+    const instruments = [
+      ...(index.spot ? [index.spot] : []),
+      ...(index.options || []),
+      ...(index.futures || [])
+    ];
+
+    for (const instrument of instruments) {
+      const exchangeType = Number(instrument.exchangeType);
+      const token = normalizeToken(instrument.token);
+
+      if (
+        !Number.isInteger(exchangeType) ||
+        !token
+      ) {
+        continue;
+      }
+
+      if (!groups.has(exchangeType)) {
+        groups.set(exchangeType, []);
+      }
+
+      groups.get(exchangeType).push(token);
+    }
+  }
+
+  const subscriptions = [...groups].map(
+    ([exchangeType, tokens]) => ({
+      exchangeType,
+      tokens: [...new Set(tokens)]
+    })
+  );
+
+  const total = subscriptions.reduce(
+    (count, group) => count + group.tokens.length,
+    0
+  );
+
+  if (
+    !total ||
+    total > config.maxSubscriptionTokens
+  ) {
+    throw new Error(
+      `Invalid subscription total ${total}; ` +
+      `configured limit ${config.maxSubscriptionTokens}`
+    );
+  }
+
+  console.log(
+    `[TradePulse] Connecting feed for ${total} instruments`
+  );
+
+  socket = await connectAngel(onTick, onStatus);
+
+  const sent = subscribeAngel(subscriptions);
+
+  onStatus({
+    connected: true,
+    started: true,
+    subscribed: total,
+    error: null,
+    phase: 'subscribed',
+    instruments: getInstrumentSummary()
+  });
+
+  console.log(
+    `[TradePulse] Live subscriptions sent: ${sent}`
+  );
+
+  emit({
+    type: 'dashboard',
+    data: getDashboard()
+  });
+
+  return socket;
+}
+
+// =====================================================
+// INSTRUMENT SUMMARY
+// =====================================================
+
+export function getInstrumentSummary() {
+  return Object.fromEntries(
+    Object.entries(contracts.indices || {}).map(
+      ([name, index]) => [
+        name,
+        {
+          spot: index.spot?.token || null,
+          optionExpiry: index.optionExpiry || null,
+          futureExpiry: index.futureExpiry || null,
+          options: index.options?.length || 0,
+          futures: index.futures?.length || 0
+        }
+      ]
+    )
+  );
+}

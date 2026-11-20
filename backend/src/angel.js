@@ -19,9 +19,20 @@ export async function loginAngel() {
   smartApi = new SmartAPI({ api_key: apiKey });
 console.log(
   '[Angel One] Available SDK methods:',
-  Object.getOwnPropertyNames(
-    Object.getPrototypeOf(smartApi)
-  ).sort()
+  Object.keys(smartApi)
+    .filter(key => typeof smartApi[key] === 'function')
+    .sort()
+);
+
+console.log(
+  '[Angel One] LTP method:',
+  typeof smartApi.ltpData
+);
+
+console.log(
+  '[Angel One] Market data method:',
+  typeof smartApi.getMarketData,
+  typeof smartApi.marketData
 );
   const totp = speakeasy.totp({
     secret: totpSecret,

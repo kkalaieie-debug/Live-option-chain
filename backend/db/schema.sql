@@ -30,5 +30,4 @@ CREATE TABLE IF NOT EXISTS oi_snapshots (
   snapshot_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS oi_snapshots_index_time_idx ON oi_snapshots(index_name, snapshot_at DESC);
-CREATE INDEX IF NOT EXISTS ticks_latest_lookup_idx
-ON ticks (index_name, instrument_key, received_at DESC);
+

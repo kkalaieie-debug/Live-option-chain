@@ -17,7 +17,12 @@ export async function loginAngel() {
   console.log('[Angel One] Starting login');
 
   smartApi = new SmartAPI({ api_key: apiKey });
-
+console.log(
+  '[Angel One] Available SDK methods:',
+  Object.getOwnPropertyNames(
+    Object.getPrototypeOf(smartApi)
+  ).sort()
+);
   const totp = speakeasy.totp({
     secret: totpSecret,
     encoding: 'base32'

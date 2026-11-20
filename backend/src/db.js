@@ -78,6 +78,7 @@ function dateValue(value) {
 // INITIALIZE DATABASE
 // --------------------------------------------------
 
+
 export async function initDb() {
   if (!pool) {
     console.warn('[Database] DATABASE_URL missing. Persistence disabled.');
@@ -96,7 +97,7 @@ export async function initDb() {
 
     await connection.query(schema);
 
-    // Safe, repeatable migration for separate OI signals.
+    // Add OI signal columns without building large history indexes.
     await connection.query(`
       ALTER TABLE oi_snapshots
         ADD COLUMN IF NOT EXISTS tick_oi_change NUMERIC,
@@ -105,21 +106,15 @@ export async function initDb() {
         ADD COLUMN IF NOT EXISTS minute_oi_change NUMERIC,
         ADD COLUMN IF NOT EXISTS minute_price_change NUMERIC,
         ADD COLUMN IF NOT EXISTS minute_classification TEXT;
-
-      CREATE INDEX IF NOT EXISTS ticks_index_instrument_time_idx
-        ON ticks(index_name, instrument_key, received_at DESC);
-
-      CREATE INDEX IF NOT EXISTS oi_snapshots_instrument_time_idx
-        ON oi_snapshots(instrument_key, snapshot_at DESC);
     `);
 
-    console.log(
-      '[Database] PostgreSQL connected; schema and OI migration ready.'
-    );
+    console.log('[Database] PostgreSQL connected.');
+    console.log('[Database] OI migration completed.');
   } finally {
     connection.release();
   }
 }
+
 
 // --------------------------------------------------
 // SAVE TICK

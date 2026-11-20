@@ -4,10 +4,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { config } from './config.js';
 
-// --------------------------------------------------
-// PostgreSQL connection
-// --------------------------------------------------
-
 export const pool = config.databaseUrl
   ? new Pool({
       connectionString: config.databaseUrl,
@@ -26,10 +22,6 @@ export const pool = config.databaseUrl
 pool?.on('error', error => {
   console.error('[Database] Pool error:', error.message);
 });
-
-// --------------------------------------------------
-// Queues: keep the latest value per instrument
-// --------------------------------------------------
 
 const tickQueue = new Map();
 const oiQueue = new Map();
@@ -83,7 +75,7 @@ function dateValue(value) {
 }
 
 // --------------------------------------------------
-// Initialize database
+// INITIALIZE DATABASE
 // --------------------------------------------------
 
 export async function initDb() {
@@ -104,15 +96,33 @@ export async function initDb() {
 
     await connection.query(schema);
 
-    console.log('[Database] PostgreSQL connected.');
-    console.log('[Database] Schema initialization completed.');
+    // Safe, repeatable migration for separate OI signals.
+    await connection.query(`
+      ALTER TABLE oi_snapshots
+        ADD COLUMN IF NOT EXISTS tick_oi_change NUMERIC,
+        ADD COLUMN IF NOT EXISTS tick_price_change NUMERIC,
+        ADD COLUMN IF NOT EXISTS tick_classification TEXT,
+        ADD COLUMN IF NOT EXISTS minute_oi_change NUMERIC,
+        ADD COLUMN IF NOT EXISTS minute_price_change NUMERIC,
+        ADD COLUMN IF NOT EXISTS minute_classification TEXT;
+
+      CREATE INDEX IF NOT EXISTS ticks_index_instrument_time_idx
+        ON ticks(index_name, instrument_key, received_at DESC);
+
+      CREATE INDEX IF NOT EXISTS oi_snapshots_instrument_time_idx
+        ON oi_snapshots(instrument_key, snapshot_at DESC);
+    `);
+
+    console.log(
+      '[Database] PostgreSQL connected; schema and OI migration ready.'
+    );
   } finally {
     connection.release();
   }
 }
 
 // --------------------------------------------------
-// Queue tick
+// SAVE TICK
 // --------------------------------------------------
 
 export async function saveTick(t) {
@@ -133,7 +143,7 @@ export async function saveTick(t) {
 }
 
 // --------------------------------------------------
-// Queue OI snapshot
+// SAVE OI SNAPSHOT
 // --------------------------------------------------
 
 export async function saveOiSnapshot(s) {
@@ -148,32 +158,38 @@ export async function saveOiSnapshot(s) {
     expiry: s.expiry ?? null,
     ltp: n(s.ltp),
     oi: n(s.oi),
+
     oiChange: n(s.oiChange),
     priceChange: n(s.priceChange),
-    classification: s.classification ?? 'Unknown'
+    classification: s.classification ?? 'Insufficient data',
+
+    tickOiChange: n(s.tickOiChange),
+    tickPriceChange: n(s.tickPriceChange),
+    tickClassification: s.tickClassification ?? null,
+
+    minuteOiChange: n(s.minuteOiChange),
+    minutePriceChange: n(s.minutePriceChange),
+    minuteClassification: s.minuteClassification ?? null
   });
 }
 
 // --------------------------------------------------
-// Batch SQL helper
+// BATCH SQL HELPER
 // --------------------------------------------------
 
 async function insertRows(table, columns, rows) {
-  if (!pool || rows.length === 0) return;
+  if (!pool || !rows.length) return;
 
   const values = [];
-  const groups = [];
 
-  for (const row of rows) {
-    const placeholders = [];
-
-    for (const value of row) {
+  const groups = rows.map(row => {
+    const placeholders = row.map(value => {
       values.push(value);
-      placeholders.push(`$${values.length}`);
-    }
+      return `$${values.length}`;
+    });
 
-    groups.push(`(${placeholders.join(',')})`);
-  }
+    return `(${placeholders.join(',')})`;
+  });
 
   const sql = `
     INSERT INTO ${table} (${columns.join(',')})
@@ -184,11 +200,11 @@ async function insertRows(table, columns, rows) {
 }
 
 // --------------------------------------------------
-// Flush a queue
+// FLUSH QUEUE
 // --------------------------------------------------
 
 async function flushOne(queue, table, columns, mapper) {
-  if (queue.size === 0) return;
+  if (!queue.size) return;
 
   const entries = [...queue.entries()].slice(0, BATCH_SIZE);
 
@@ -196,14 +212,18 @@ async function flushOne(queue, table, columns, mapper) {
     queue.delete(key);
   }
 
-  const rows = entries.map(([, item]) => mapper(item));
-
   try {
-    await insertRows(table, columns, rows);
+    await insertRows(
+      table,
+      columns,
+      entries.map(([, item]) => mapper(item))
+    );
   } catch (error) {
     // Restore failed items without overwriting newer ticks.
     for (const [key, item] of entries) {
-      if (!queue.has(key)) queue.set(key, item);
+      if (!queue.has(key)) {
+        queue.set(key, item);
+      }
     }
 
     warn(`${table} write failed: ${error.message}`);
@@ -211,7 +231,7 @@ async function flushOne(queue, table, columns, mapper) {
 }
 
 // --------------------------------------------------
-// Periodic database writer
+// PERIODIC DATABASE WRITER
 // --------------------------------------------------
 
 async function flushQueues() {
@@ -263,7 +283,13 @@ async function flushQueues() {
         'oi',
         'oi_change',
         'price_change',
-        'classification'
+        'classification',
+        'tick_oi_change',
+        'tick_price_change',
+        'tick_classification',
+        'minute_oi_change',
+        'minute_price_change',
+        'minute_classification'
       ],
       s => [
         s.key,
@@ -276,13 +302,47 @@ async function flushQueues() {
         s.oi,
         s.oiChange,
         s.priceChange,
-        s.classification
+        s.classification,
+        s.tickOiChange,
+        s.tickPriceChange,
+        s.tickClassification,
+        s.minuteOiChange,
+        s.minutePriceChange,
+        s.minuteClassification
       ]
     );
   } finally {
     isFlushing = false;
   }
 }
+
+// --------------------------------------------------
+// FLUSH PENDING WRITES BEFORE BASELINE RESTORE
+// --------------------------------------------------
+
+export async function flushPendingWrites() {
+  if (!pool) return;
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    while (isFlushing) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+
+    await flushQueues();
+
+    if (!tickQueue.size && !oiQueue.size) {
+      return;
+    }
+  }
+
+  if (tickQueue.size || oiQueue.size) {
+    warn('Some queued writes remain pending after startup flush.');
+  }
+}
+
+// --------------------------------------------------
+// AUTOMATIC FLUSH TIMER
+// --------------------------------------------------
 
 const timer = setInterval(() => {
   flushQueues().catch(error => {
@@ -293,25 +353,81 @@ const timer = setInterval(() => {
 timer.unref();
 
 // --------------------------------------------------
-// History API
+// LOAD LATEST TICK BASELINES
 // --------------------------------------------------
 
-export async function latestSnapshots(indexName) {
-  if (!pool) return [];
+export async function loadLatestTickBaselines(indexNames = []) {
+  if (!pool || !indexNames.length) return [];
 
-  const result = await pool.query(
-    `SELECT DISTINCT ON (instrument_key) *
-     FROM ticks
-     WHERE index_name = $1
-     ORDER BY instrument_key, received_at DESC`,
-    [indexName]
-  );
+  const result = await pool.query(`
+    SELECT DISTINCT ON (instrument_key)
+      instrument_key,
+      index_name,
+      segment,
+      option_type,
+      strike,
+      expiry,
+      ltp,
+      oi,
+      volume,
+      received_at
+    FROM ticks
+    WHERE index_name = ANY($1::text[])
+      AND received_at >= NOW() - INTERVAL '5 minutes'
+    ORDER BY instrument_key, received_at DESC
+  `, [indexNames]);
 
   return result.rows;
 }
 
 // --------------------------------------------------
-// Queue diagnostics
+// LOAD ONE-MINUTE BASELINES
+// --------------------------------------------------
+
+export async function loadMinuteTickBaselines(indexNames = []) {
+  if (!pool || !indexNames.length) return [];
+
+  const result = await pool.query(`
+    SELECT DISTINCT ON (instrument_key)
+      instrument_key,
+      index_name,
+      segment,
+      option_type,
+      strike,
+      expiry,
+      ltp,
+      oi,
+      volume,
+      received_at
+    FROM ticks
+    WHERE index_name = ANY($1::text[])
+      AND received_at <= NOW() - INTERVAL '60 seconds'
+      AND received_at >= NOW() - INTERVAL '5 minutes'
+    ORDER BY instrument_key, received_at DESC
+  `, [indexNames]);
+
+  return result.rows;
+}
+
+// --------------------------------------------------
+// HISTORY API
+// --------------------------------------------------
+
+export async function latestSnapshots(indexName) {
+  if (!pool) return [];
+
+  const result = await pool.query(`
+    SELECT DISTINCT ON (instrument_key) *
+    FROM ticks
+    WHERE index_name = $1
+    ORDER BY instrument_key, received_at DESC
+  `, [indexName]);
+
+  return result.rows;
+}
+
+// --------------------------------------------------
+// QUEUE DIAGNOSTICS
 // --------------------------------------------------
 
 export function getDatabaseQueueStatus() {

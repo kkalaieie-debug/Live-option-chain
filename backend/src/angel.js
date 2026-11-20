@@ -74,6 +74,7 @@ console.log(
   };
 }
 
+
 export async function getAngelLtp(
   exchange,
   tradingsymbol,
@@ -83,30 +84,57 @@ export async function getAngelLtp(
     throw new Error('Angel One session is not initialized');
   }
 
-  const result = await smartApi.ltpData({
-    exchange,
-    tradingsymbol,
-    symboltoken: String(symboltoken)
+  if (typeof smartApi.marketData !== 'function') {
+    throw new Error('Angel One marketData method is unavailable');
+  }
+
+  const token = String(symboltoken);
+
+  console.log(
+    `[Angel One] Requesting LTP: ${exchange} ${tradingsymbol} (${token})`
+  );
+
+  const result = await smartApi.marketData({
+    mode: 'LTP',
+    exchangeTokens: {
+      [exchange]: [token]
+    }
   });
 
-  if (!result?.status || !result?.data) {
+  const data = result?.data ?? result;
+  const fetched = data?.fetched ?? data?.data?.fetched ?? [];
+
+  const quote = fetched.find(
+    item => String(item.symbolToken) === token
+  );
+
+  if (!quote) {
     throw new Error(
-      `LTP failed for ${tradingsymbol}: ${result?.message || 'No data'}`
+      `LTP unavailable for ${tradingsymbol}: ${result?.message || 'No matching quote returned'}`
     );
   }
 
-  const ltp = Number(result.data.ltp);
+  const ltp = Number(quote.ltp);
 
   if (!Number.isFinite(ltp) || ltp <= 0) {
-    throw new Error(`Invalid LTP for ${tradingsymbol}`);
+    throw new Error(`Invalid LTP received for ${tradingsymbol}`);
   }
 
   console.log(
     `[Angel One] LTP received: ${tradingsymbol} = ${ltp}`
   );
 
-  return result;
+  return {
+    status: true,
+    data: {
+      ltp,
+      exchange,
+      tradingSymbol: tradingsymbol,
+      symboltoken: token
+    }
+  };
 }
+
 
 export async function connectAngel(onTick, onStatus) {
   if (!session) {
